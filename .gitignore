@@ -1,0 +1,14 @@
+.env
+.venv/
+.coverage
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+results/*
+!results/.gitkeep
+playground-ui/node_modules/
+playground-ui/.next/
+playground-ui/.wrangler/
+playground-ui/dist/

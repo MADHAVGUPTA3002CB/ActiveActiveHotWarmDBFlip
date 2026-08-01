@@ -1,0 +1,281 @@
+name: flipbench
+
+services:
+  hot:
+    image: postgres:17.10-bookworm
+    environment:
+      POSTGRES_DB: cards
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env and set POSTGRES_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+      - -c
+      - synchronous_commit=on
+      - -c
+      - fsync=on
+      - -c
+      - track_commit_timestamp=on
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - hot-data:/var/lib/postgresql/data
+      - ./docker/hot-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cards"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [flipbench]
+
+  warm:
+    image: postgres:17.10-bookworm
+    environment:
+      POSTGRES_DB: cards
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env and set POSTGRES_PASSWORD}
+    command:
+      - postgres
+      - -c
+      - synchronous_commit=on
+      - -c
+      - fsync=on
+      - -c
+      - track_io_timing=on
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - warm-data:/var/lib/postgresql/data
+      - ./docker/warm-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cards"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks: [flipbench]
+
+  kafka:
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_HEAP_OPTS: ${KAFKA_BROKER_HEAP_OPTS:--Xms256M -Xmx512M}
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:19092,CONTROLLER://:19093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:19093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_LOG_RETENTION_BYTES: 268435456
+      KAFKA_LOG_SEGMENT_BYTES: 67108864
+      KAFKA_LOG_RETENTION_MS: 600000
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 10000
+    ports:
+      - "127.0.0.1:29092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    networks: [flipbench]
+
+  source-connect:
+    image: quay.io/debezium/connect:3.6.0.Final
+    depends_on:
+      kafka:
+        condition: service_healthy
+      hot:
+        condition: service_healthy
+      warm:
+        condition: service_healthy
+    environment:
+      KAFKA_HEAP_OPTS: ${CONNECT_WORKER_HEAP_OPTS:--Xms256M -Xmx768M}
+      BOOTSTRAP_SERVERS: kafka:19092
+      GROUP_ID: flipbench-connect-workers
+      CONFIG_STORAGE_TOPIC: flipbench-connect-configs
+      OFFSET_STORAGE_TOPIC: flipbench-connect-offsets
+      STATUS_STORAGE_TOPIC: flipbench-connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: ${CONNECT_INTERNAL_TOPIC_REPLICATION_FACTOR:-1}
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: ${CONNECT_INTERNAL_TOPIC_REPLICATION_FACTOR:-1}
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: ${CONNECT_INTERNAL_TOPIC_REPLICATION_FACTOR:-1}
+      CONNECT_CONFIG_STORAGE_PARTITIONS: ${CONNECT_CONFIG_STORAGE_PARTITIONS:-1}
+      CONNECT_OFFSET_STORAGE_PARTITIONS: ${CONNECT_OFFSET_STORAGE_PARTITIONS:-25}
+      CONNECT_STATUS_STORAGE_PARTITIONS: ${CONNECT_STATUS_STORAGE_PARTITIONS:-5}
+      OFFSET_FLUSH_INTERVAL_MS: ${CONNECT_OFFSET_FLUSH_INTERVAL_MS:-1000}
+      OFFSET_FLUSH_TIMEOUT_MS: ${CONNECT_OFFSET_FLUSH_TIMEOUT_MS:-5000}
+      CONNECT_SCHEDULED_REBALANCE_MAX_DELAY_MS: ${CONNECT_SCHEDULED_REBALANCE_MAX_DELAY_MS:-30000}
+      CONNECT_SESSION_TIMEOUT_MS: ${CONNECT_SESSION_TIMEOUT_MS:-10000}
+      CONNECT_HEARTBEAT_INTERVAL_MS: ${CONNECT_HEARTBEAT_INTERVAL_MS:-3000}
+      # Local-only: required so the source connector can pin acks/idempotence.
+      CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY: All
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "true"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "true"
+    ports:
+      - "127.0.0.1:8083:8083"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://localhost:8083/ >/dev/null"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    networks: [flipbench]
+
+  sink-connect:
+    image: quay.io/debezium/connect:3.6.0.Final
+    depends_on:
+      kafka:
+        condition: service_healthy
+      warm:
+        condition: service_healthy
+      hot:
+        condition: service_healthy
+    environment:
+      KAFKA_HEAP_OPTS: ${CONNECT_WORKER_HEAP_OPTS:--Xms256M -Xmx768M}
+      BOOTSTRAP_SERVERS: kafka:19092
+      GROUP_ID: flipbench-connect-workers
+      CONFIG_STORAGE_TOPIC: flipbench-connect-configs
+      OFFSET_STORAGE_TOPIC: flipbench-connect-offsets
+      STATUS_STORAGE_TOPIC: flipbench-connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: ${CONNECT_INTERNAL_TOPIC_REPLICATION_FACTOR:-1}
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: ${CONNECT_INTERNAL_TOPIC_REPLICATION_FACTOR:-1}
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: ${CONNECT_INTERNAL_TOPIC_REPLICATION_FACTOR:-1}
+      CONNECT_CONFIG_STORAGE_PARTITIONS: ${CONNECT_CONFIG_STORAGE_PARTITIONS:-1}
+      CONNECT_OFFSET_STORAGE_PARTITIONS: ${CONNECT_OFFSET_STORAGE_PARTITIONS:-25}
+      CONNECT_STATUS_STORAGE_PARTITIONS: ${CONNECT_STATUS_STORAGE_PARTITIONS:-5}
+      OFFSET_FLUSH_INTERVAL_MS: ${CONNECT_OFFSET_FLUSH_INTERVAL_MS:-1000}
+      OFFSET_FLUSH_TIMEOUT_MS: ${CONNECT_OFFSET_FLUSH_TIMEOUT_MS:-5000}
+      CONNECT_SCHEDULED_REBALANCE_MAX_DELAY_MS: ${CONNECT_SCHEDULED_REBALANCE_MAX_DELAY_MS:-30000}
+      CONNECT_SESSION_TIMEOUT_MS: ${CONNECT_SESSION_TIMEOUT_MS:-10000}
+      CONNECT_HEARTBEAT_INTERVAL_MS: ${CONNECT_HEARTBEAT_INTERVAL_MS:-3000}
+      CONNECT_WORKER_HEAP_OPTS: ${CONNECT_WORKER_HEAP_OPTS:--Xms256M -Xmx768M}
+      KAFKA_BROKER_HEAP_OPTS: ${KAFKA_BROKER_HEAP_OPTS:--Xms256M -Xmx512M}
+      CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY: All
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "true"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "true"
+    ports:
+      - "127.0.0.1:8084:8083"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://localhost:8083/ >/dev/null"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    networks: [flipbench]
+
+  runner:
+    build:
+      context: .
+      dockerfile: docker/runner.Dockerfile
+    profiles: [tools]
+    depends_on:
+      hot:
+        condition: service_healthy
+      warm:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      source-connect:
+        condition: service_healthy
+      sink-connect:
+        condition: service_healthy
+    environment:
+      HOT_DSN: postgresql://postgres:${POSTGRES_PASSWORD}@hot:5432/cards
+      WARM_DSN: postgresql://postgres:${POSTGRES_PASSWORD}@warm:5432/cards
+      KAFKA_BOOTSTRAP: kafka:19092
+      SOURCE_CONNECT_URL: http://source-connect:8083
+      SINK_CONNECT_URL: http://source-connect:8083
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      CDC_PASSWORD: ${CDC_PASSWORD:-}
+      SINK_PASSWORD: ${SINK_PASSWORD:-}
+      TABLE_COUNT: ${TABLE_COUNT:-5}
+      CONNECT_OFFSET_FLUSH_INTERVAL_MS: ${CONNECT_OFFSET_FLUSH_INTERVAL_MS:-1000}
+      CONNECT_OFFSET_FLUSH_TIMEOUT_MS: ${CONNECT_OFFSET_FLUSH_TIMEOUT_MS:-5000}
+      CONNECT_INTERNAL_TOPIC_REPLICATION_FACTOR: ${CONNECT_INTERNAL_TOPIC_REPLICATION_FACTOR:-1}
+      CONNECT_SCHEDULED_REBALANCE_MAX_DELAY_MS: ${CONNECT_SCHEDULED_REBALANCE_MAX_DELAY_MS:-30000}
+      CONNECT_SESSION_TIMEOUT_MS: ${CONNECT_SESSION_TIMEOUT_MS:-10000}
+      CONNECT_HEARTBEAT_INTERVAL_MS: ${CONNECT_HEARTBEAT_INTERVAL_MS:-3000}
+      KAFKA_TOPIC_REPLICATION_FACTOR: ${KAFKA_TOPIC_REPLICATION_FACTOR:-1}
+      KAFKA_MIN_INSYNC_REPLICAS: ${KAFKA_MIN_INSYNC_REPLICAS:-1}
+      SINK_TASKS_MAX: ${SINK_TASKS_MAX:-1}
+      SINK_BATCH_SIZE: ${SINK_BATCH_SIZE:-500}
+      SINK_POOL_MIN_SIZE: ${SINK_POOL_MIN_SIZE:-1}
+      SINK_POOL_MAX_SIZE: ${SINK_POOL_MAX_SIZE:-4}
+    volumes:
+      - ./results:/app/results
+    networks: [flipbench]
+
+  playground-api:
+    build:
+      context: .
+      dockerfile: docker/runner.Dockerfile
+    profiles: [playground]
+    entrypoint: ["python", "-m", "flipbench.playground_api"]
+    depends_on:
+      hot:
+        condition: service_healthy
+      warm:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      source-connect:
+        condition: service_healthy
+      sink-connect:
+        condition: service_healthy
+    environment:
+      HOT_DSN: postgresql://postgres:${POSTGRES_PASSWORD}@hot:5432/cards
+      WARM_DSN: postgresql://postgres:${POSTGRES_PASSWORD}@warm:5432/cards
+      KAFKA_BOOTSTRAP: kafka:19092
+      SOURCE_CONNECT_URL: http://source-connect:8083
+      SINK_CONNECT_URL: http://source-connect:8083
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      CDC_PASSWORD: ${CDC_PASSWORD:-}
+      SINK_PASSWORD: ${SINK_PASSWORD:-}
+      TABLE_COUNT: ${TABLE_COUNT:-5}
+      CONNECT_OFFSET_FLUSH_INTERVAL_MS: ${CONNECT_OFFSET_FLUSH_INTERVAL_MS:-1000}
+      CONNECT_OFFSET_FLUSH_TIMEOUT_MS: ${CONNECT_OFFSET_FLUSH_TIMEOUT_MS:-5000}
+      CONNECT_INTERNAL_TOPIC_REPLICATION_FACTOR: ${CONNECT_INTERNAL_TOPIC_REPLICATION_FACTOR:-1}
+      CONNECT_SCHEDULED_REBALANCE_MAX_DELAY_MS: ${CONNECT_SCHEDULED_REBALANCE_MAX_DELAY_MS:-30000}
+      CONNECT_SESSION_TIMEOUT_MS: ${CONNECT_SESSION_TIMEOUT_MS:-10000}
+      CONNECT_HEARTBEAT_INTERVAL_MS: ${CONNECT_HEARTBEAT_INTERVAL_MS:-3000}
+      KAFKA_TOPIC_REPLICATION_FACTOR: ${KAFKA_TOPIC_REPLICATION_FACTOR:-1}
+      KAFKA_MIN_INSYNC_REPLICAS: ${KAFKA_MIN_INSYNC_REPLICAS:-1}
+      SINK_TASKS_MAX: ${SINK_TASKS_MAX:-1}
+      SINK_BATCH_SIZE: ${SINK_BATCH_SIZE:-500}
+      SINK_POOL_MIN_SIZE: ${SINK_POOL_MIN_SIZE:-1}
+      SINK_POOL_MAX_SIZE: ${SINK_POOL_MAX_SIZE:-4}
+      PLAYGROUND_API_PORT: 8090
+      PLAYGROUND_ALLOWED_ORIGIN: http://localhost:3000
+      PLAYGROUND_ENVIRONMENT_GENERATION_ID: ${PLAYGROUND_ENVIRONMENT_GENERATION_ID:-legacy}
+    ports:
+      - "127.0.0.1:8090:8090"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ./results:/app/results
+    networks: [flipbench]
+
+networks:
+  flipbench:
+    name: flipbench
+
+volumes:
+  hot-data:
+  warm-data:
+  kafka-data:

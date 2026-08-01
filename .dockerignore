@@ -1,0 +1,6 @@
+.git
+.venv
+.coverage
+**/__pycache__
+playground-ui
+results/*
