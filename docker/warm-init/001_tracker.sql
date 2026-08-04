@@ -36,10 +36,24 @@ CREATE TABLE IF NOT EXISTS public.flip_attempts (
     manifest jsonb NOT NULL,
     manifest_sha256 text NOT NULL,
     connector_config_sha256 text NOT NULL,
+    write_fence_mode text NOT NULL DEFAULT 'warm_tracker_advisory_v1'
+        CHECK (write_fence_mode IN (
+            'warm_tracker_advisory_v1',
+            'hot_transactional_v1',
+            'optimistic_detach_v1'
+        )),
+    hot_ownership_epoch bigint,
+    hot_gate_version bigint,
     stage_timestamps jsonb NOT NULL DEFAULT '{}'::jsonb,
     error jsonb,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CHECK (
+        (write_fence_mode = 'warm_tracker_advisory_v1'
+            AND hot_ownership_epoch IS NULL AND hot_gate_version IS NULL)
+        OR (write_fence_mode IN ('hot_transactional_v1', 'optimistic_detach_v1')
+            AND hot_ownership_epoch > 0 AND hot_gate_version >= 0)
+    )
 );
 
 ALTER TABLE public.partition_tracker

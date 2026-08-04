@@ -2,7 +2,93 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://local.flipbench/flip-result.schema.json",
   "title": "Flipbench result",
+  "$comment": "This schema validates artifact structure. flipbench.results.validate_result is authoritative for cross-field identity, LSN, offset and timing invariants that JSON Schema cannot express.",
   "type": "object",
+  "$defs": {
+    "laneEvidenceV3": {
+      "type": "object",
+      "required": [
+        "connector_name",
+        "connector_state",
+        "task_states",
+        "slot_name",
+        "slot_active",
+        "confirmed_lsn",
+        "restart_lsn",
+        "lag_bytes",
+        "publication_name",
+        "topic_prefix"
+      ],
+      "properties": {
+        "connector_name": {"type": "string", "minLength": 1, "maxLength": 128},
+        "connector_state": {"enum": ["RUNNING", "PAUSED"]},
+        "task_states": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"enum": ["RUNNING", "PAUSED"]}
+        },
+        "slot_name": {"type": "string", "minLength": 1, "maxLength": 128},
+        "slot_active": {"type": "boolean"},
+        "confirmed_lsn": {"type": "string", "pattern": "^[0-9A-Fa-f]{1,8}/[0-9A-Fa-f]{1,8}$"},
+        "restart_lsn": {"type": ["string", "null"], "pattern": "^[0-9A-Fa-f]{1,8}/[0-9A-Fa-f]{1,8}$"},
+        "lag_bytes": {"type": "integer", "minimum": 0},
+        "publication_name": {"type": "string", "minLength": 1, "maxLength": 128},
+        "topic_prefix": {"type": "string", "minLength": 1, "maxLength": 249}
+      },
+      "additionalProperties": true
+    },
+    "sharedSnapshotV3": {
+      "type": "object",
+      "required": ["shared"],
+      "properties": {"shared": {"$ref": "#/$defs/laneEvidenceV3"}},
+      "additionalProperties": false
+    },
+    "isolatedSnapshotV3": {
+      "type": "object",
+      "required": ["active", "migration"],
+      "properties": {
+        "active": {"$ref": "#/$defs/laneEvidenceV3"},
+        "migration": {"$ref": "#/$defs/laneEvidenceV3"}
+      },
+      "additionalProperties": false
+    },
+    "hotIdentityV2Plus": {
+      "type": "object",
+      "required": ["cell", "database", "slot", "system_identifier"],
+      "properties": {
+        "cell": {"type": "string", "minLength": 1, "maxLength": 64},
+        "database": {"const": "cards"},
+        "slot": {"type": "string", "minLength": 1, "maxLength": 128},
+        "system_identifier": {"type": "string", "pattern": "^[0-9]{1,20}$"}
+      }
+    },
+    "fenceWakeupV4": {
+      "type": "object",
+      "required": [
+        "mode",
+        "lane",
+        "heartbeat_table",
+        "attempted",
+        "applied",
+        "rows_updated",
+        "post_update_wal_lsn",
+        "duration_ns",
+        "confirmed_flush_lsn_at_t7"
+      ],
+      "properties": {
+        "mode": {"enum": ["passive", "immediate_heartbeat"]},
+        "lane": {"enum": ["shared", "migration"]},
+        "heartbeat_table": {"enum": ["dbz_heartbeat", "dbz_heartbeat_migration"]},
+        "attempted": {"type": "boolean"},
+        "applied": {"type": "boolean"},
+        "rows_updated": {"type": "integer", "minimum": 0, "maximum": 1},
+        "post_update_wal_lsn": {"type": ["string", "null"], "pattern": "^[0-9A-Fa-f]{1,8}/[0-9A-Fa-f]{1,8}$"},
+        "duration_ns": {"type": "integer", "minimum": 0},
+        "confirmed_flush_lsn_at_t7": {"type": ["string", "null"], "pattern": "^[0-9A-Fa-f]{1,8}/[0-9A-Fa-f]{1,8}$"}
+      },
+      "additionalProperties": false
+    }
+  },
   "required": [
     "schema_version",
     "run_id",
@@ -22,7 +108,7 @@
     "error"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"enum": [1, 2, 3, 4, 5, 6, 7]},
     "run_id": {"type": "string", "format": "uuid"},
     "attempt_id": {"type": "string", "format": "uuid"},
     "attempt_epoch": {"type": ["integer", "null"], "minimum": 1},
@@ -37,11 +123,215 @@
     "ownership_outcome": {"enum": ["success", "failed", "reverted"]},
     "verification_outcome": {"enum": ["not_run", "passed", "failed"]},
     "gc_eligible": {"type": "boolean"},
-    "topology": {"type": "object"},
+    "topology": {
+      "type": "object",
+      "properties": {
+        "source_topology": {"enum": ["shared", "isolated"]},
+        "source_connector_count": {"enum": [1, 2]},
+        "fence_source_lane": {"enum": ["shared", "migration"]},
+        "fence_slot_name": {"type": "string", "minLength": 1, "maxLength": 128},
+        "fence_publication_name": {"type": "string", "minLength": 1, "maxLength": 128},
+        "source_topic_prefixes": {"type": "object"}
+      }
+    },
+    "source_lane_evidence": {"type": "object"},
+    "sink_connector_evidence": {"type": "object"},
+    "fence_lsn": {"type": ["string", "null"], "pattern": "^[0-9A-Fa-f]{1,8}/[0-9A-Fa-f]{1,8}$"},
+    "fence_wakeup": {"$ref": "#/$defs/fenceWakeupV4"},
+    "marker_fence": {"type": ["object", "null"]},
+    "hot_identity": {
+      "type": ["object", "null"],
+      "properties": {"slot": {"type": "string", "minLength": 1, "maxLength": 128}}
+    },
     "connect_worker_config": {"type": "object"},
     "error": {"type": ["object", "null"]}
   },
   "allOf": [
+    {
+      "if": {"properties": {"schema_version": {"enum": [2, 3, 4, 5, 6, 7]}}},
+      "then": {
+        "required": ["source_lane_evidence", "fence_lsn", "hot_identity"],
+        "properties": {
+          "topology": {
+            "required": [
+              "source_topology",
+              "source_connector_count",
+              "fence_source_lane",
+              "fence_slot_name",
+              "fence_publication_name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {"enum": [2, 3, 4, 5, 6, 7]},
+          "outcome": {"const": "success"}
+        },
+        "required": ["schema_version", "outcome"]
+      },
+      "then": {
+        "properties": {"hot_identity": {"$ref": "#/$defs/hotIdentityV2Plus"}}
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {"enum": [3, 4, 5, 6, 7]},
+          "topology": {
+            "properties": {"source_topology": {"const": "shared"}},
+            "required": ["source_topology"]
+          }
+        },
+        "required": ["schema_version", "topology"]
+      },
+      "then": {
+        "properties": {
+          "topology": {
+            "required": ["source_topic_prefixes"],
+            "properties": {
+              "source_topic_prefixes": {
+                "type": "object",
+                "required": ["shared"],
+                "properties": {"shared": {"type": "string", "minLength": 1, "maxLength": 249}},
+                "additionalProperties": false
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {"enum": [3, 4, 5, 6, 7]},
+          "topology": {
+            "properties": {"source_topology": {"const": "isolated"}},
+            "required": ["source_topology"]
+          }
+        },
+        "required": ["schema_version", "topology"]
+      },
+      "then": {
+        "properties": {
+          "topology": {
+            "required": ["source_topic_prefixes"],
+            "properties": {
+              "source_topic_prefixes": {
+                "type": "object",
+                "required": ["active", "migration"],
+                "properties": {
+                  "active": {"type": "string", "minLength": 1, "maxLength": 249},
+                  "migration": {"type": "string", "minLength": 1, "maxLength": 249}
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {"enum": [3, 4, 5, 6, 7]},
+          "outcome": {"const": "success"},
+          "topology": {
+            "properties": {"source_topology": {"const": "shared"}},
+            "required": ["source_topology"]
+          }
+        },
+        "required": ["schema_version", "outcome", "topology"]
+      },
+      "then": {
+        "properties": {
+          "topology": {
+            "required": ["source_topic_prefixes"],
+            "properties": {
+              "source_topic_prefixes": {
+                "type": "object",
+                "required": ["shared"],
+                "properties": {"shared": {"type": "string", "minLength": 1, "maxLength": 249}},
+                "additionalProperties": false
+              }
+            }
+          },
+          "source_lane_evidence": {
+            "type": "object",
+            "required": ["t1", "t5", "t7", "t13"],
+            "properties": {
+              "t1": {"$ref": "#/$defs/sharedSnapshotV3"},
+              "t5": {"$ref": "#/$defs/sharedSnapshotV3"},
+              "t7": {"$ref": "#/$defs/sharedSnapshotV3"},
+              "t13": {"$ref": "#/$defs/sharedSnapshotV3"}
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {"enum": [3, 4, 5, 6, 7]},
+          "outcome": {"const": "success"},
+          "topology": {
+            "properties": {"source_topology": {"const": "isolated"}},
+            "required": ["source_topology"]
+          }
+        },
+        "required": ["schema_version", "outcome", "topology"]
+      },
+      "then": {
+        "properties": {
+          "topology": {
+            "required": ["source_topic_prefixes"],
+            "properties": {
+              "source_topic_prefixes": {
+                "type": "object",
+                "required": ["active", "migration"],
+                "properties": {
+                  "active": {"type": "string", "minLength": 1, "maxLength": 249},
+                  "migration": {"type": "string", "minLength": 1, "maxLength": 249}
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "source_lane_evidence": {
+            "type": "object",
+            "required": ["t1", "t5", "t7", "t13"],
+            "properties": {
+              "t1": {"$ref": "#/$defs/isolatedSnapshotV3"},
+              "t5": {"$ref": "#/$defs/isolatedSnapshotV3"},
+              "t7": {"$ref": "#/$defs/isolatedSnapshotV3"},
+              "t13": {"$ref": "#/$defs/isolatedSnapshotV3"}
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"enum": [4, 5, 6, 7]}},
+        "required": ["schema_version"]
+      },
+      "then": {
+        "required": ["fence_wakeup"]
+      }
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"enum": [5, 6, 7]}},
+        "required": ["schema_version"]
+      },
+      "then": {
+        "required": ["marker_fence"]
+      }
+    },
     {
       "if": {"properties": {"outcome": {"const": "success"}}},
       "then": {

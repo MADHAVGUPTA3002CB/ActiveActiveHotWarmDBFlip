@@ -2,6 +2,8 @@ SHELL := /bin/sh
 COMPOSE ?= $(shell if docker compose version >/dev/null 2>&1; then echo "docker compose"; elif docker-compose version >/dev/null 2>&1; then echo "docker-compose"; else echo "docker compose"; fi)
 COMPOSE_RF3 ?= $(COMPOSE) -f compose.yaml -f compose.rf3.yaml
 TABLE_COUNT ?= 5
+SOURCE_TOPOLOGY ?= shared
+FENCE_WAKEUP_MODE ?= passive
 SOURCE_BACKLOG_PER_TABLE ?= 1000
 SINK_BACKLOG_PER_TABLE ?= 2000
 OVERLOAD_BATCH_PER_TABLE ?= 1000
@@ -20,8 +22,10 @@ PRODLIKE_MAX_SOURCE_LAG_BYTES ?= 8388608
 PRODLIKE_MAX_SINK_LAG_RECORDS ?= 10
 PRODLIKE_PARK_BUDGET_MS ?= 200
 PRODLIKE_REVERT_RESERVE_MS ?= 50
+BENCHMARK_PLAN ?= config/benchmark-plans/d-e-standard.json
+CONFIRM_RESET ?=
 
-.PHONY: preflight test safety-coverage config config-rf3 up up-rf3 setup setup-rf3 benchmark benchmark-running benchmark-prodlike benchmark-prodlike-rf3 playground-api playground-api-rf3 playground-supervisor playground-ui playground playground-rf3 down reset reset-rf3 logs
+.PHONY: preflight test safety-coverage live-contracts-rf3 config config-rf3 up up-rf3 setup setup-rf3 benchmark benchmark-running benchmark-prodlike benchmark-prodlike-rf3 benchmark-plan benchmark-plan-dry-run playground-api playground-api-rf3 playground-supervisor playground-ui playground playground-rf3 down down-rf3 reset reset-rf3 logs logs-rf3
 
 preflight:
 	@command -v docker >/dev/null || { echo "Docker is required"; exit 1; }
@@ -36,9 +40,15 @@ test:
 
 safety-coverage:
 	PYTHONPATH=src .venv/bin/python -m coverage run --branch \
-		--source=flipbench.core,flipbench.settings,flipbench.connector_configs,flipbench.results,flipbench.playground_results,flipbench.playground_supervisor \
+		--source=flipbench.core,flipbench.settings,flipbench.connector_configs,flipbench.results,flipbench.playground,flipbench.traffic,flipbench.matrix,flipbench.benchmark_plan,flipbench.playground_results,flipbench.playground_supervisor \
 		-m unittest discover -s tests -p 'test_*.py'
 	.venv/bin/python -m coverage report --fail-under=80
+
+live-contracts-rf3:
+	FLIPBENCH_INTEGRATION=1 $(COMPOSE_RF3) --profile tools run --rm --build \
+		--entrypoint python -e FLIPBENCH_INTEGRATION=1 \
+		-v $(CURDIR)/tests:/app/tests:ro runner \
+		-m unittest tests.test_postgres_publications tests.integration.test_stack_contract -v
 
 config: preflight
 	$(COMPOSE) config --quiet
@@ -62,7 +72,8 @@ benchmark:
 	$(COMPOSE) --profile tools run --rm --build runner benchmark \
 		--tables $(TABLE_COUNT) \
 		--source-events-per-table $(SOURCE_BACKLOG_PER_TABLE) \
-		--sink-events-per-table $(SINK_BACKLOG_PER_TABLE)
+		--sink-events-per-table $(SINK_BACKLOG_PER_TABLE) \
+		--fence-wakeup-mode $(FENCE_WAKEUP_MODE)
 
 benchmark-running:
 	$(COMPOSE) --profile tools run --rm --build runner benchmark-running \
@@ -74,7 +85,8 @@ benchmark-running:
 		--min-sink-lag-records-per-partition $(MIN_SINK_LAG_RECORDS_PER_PARTITION) \
 		--stable-samples $(STABLE_LAG_SAMPLES) \
 		--max-admitted-rows-per-partition $(MAX_ADMITTED_ROWS_PER_PARTITION) \
-		--admission-timeout-seconds $(ADMISSION_TIMEOUT_SECONDS)
+		--admission-timeout-seconds $(ADMISSION_TIMEOUT_SECONDS) \
+		--fence-wakeup-mode $(FENCE_WAKEUP_MODE)
 
 benchmark-prodlike:
 	$(COMPOSE) --profile tools run --rm --build runner benchmark-prodlike \
@@ -86,7 +98,8 @@ benchmark-prodlike:
 		--max-source-lag-bytes $(PRODLIKE_MAX_SOURCE_LAG_BYTES) \
 		--max-sink-lag-records-per-partition $(PRODLIKE_MAX_SINK_LAG_RECORDS) \
 		--park-budget-ms $(PRODLIKE_PARK_BUDGET_MS) \
-		--revert-reserve-ms $(PRODLIKE_REVERT_RESERVE_MS)
+		--revert-reserve-ms $(PRODLIKE_REVERT_RESERVE_MS) \
+		--fence-wakeup-mode $(FENCE_WAKEUP_MODE)
 
 benchmark-prodlike-rf3:
 	$(COMPOSE_RF3) --profile tools run --rm --build runner benchmark-prodlike \
@@ -98,7 +111,16 @@ benchmark-prodlike-rf3:
 		--max-source-lag-bytes $(PRODLIKE_MAX_SOURCE_LAG_BYTES) \
 		--max-sink-lag-records-per-partition $(PRODLIKE_MAX_SINK_LAG_RECORDS) \
 		--park-budget-ms $(PRODLIKE_PARK_BUDGET_MS) \
-		--revert-reserve-ms $(PRODLIKE_REVERT_RESERVE_MS)
+		--revert-reserve-ms $(PRODLIKE_REVERT_RESERVE_MS) \
+		--fence-wakeup-mode $(FENCE_WAKEUP_MODE)
+
+benchmark-plan:
+	@PYTHONPATH=src .venv/bin/python tools/run_benchmark_plan.py \
+		--plan $(BENCHMARK_PLAN) --confirm-reset $(CONFIRM_RESET)
+
+benchmark-plan-dry-run:
+	@PYTHONPATH=src .venv/bin/python tools/run_benchmark_plan.py \
+		--plan $(BENCHMARK_PLAN) --dry-run
 
 playground-api: preflight
 	$(COMPOSE) --profile playground up -d --build playground-api
@@ -123,11 +145,17 @@ playground-rf3: playground-api-rf3
 logs:
 	$(COMPOSE) logs --tail=200 hot warm kafka source-connect sink-connect
 
+logs-rf3:
+	$(COMPOSE_RF3) logs --tail=200 hot warm kafka kafka-2 kafka-3 source-connect sink-connect
+
 down:
 	$(COMPOSE) down
 
+down-rf3:
+	$(COMPOSE_RF3) down
+
 reset:
-	$(COMPOSE) down --volumes
+	$(COMPOSE) --profile playground down --volumes --remove-orphans
 
 reset-rf3:
-	$(COMPOSE_RF3) down --volumes
+	$(COMPOSE_RF3) --profile playground down --volumes --remove-orphans

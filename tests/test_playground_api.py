@@ -77,6 +77,26 @@ class PlaygroundMaintenanceTests(unittest.TestCase):
         self.assertTrue(runtime._maintenance)
         self.assertEqual(runtime.workload.stop_all.call_count, 2)
 
+    def test_live_target_rate_change_is_allowed_but_pool_shape_is_frozen(self) -> None:
+        from flipbench.playground import WorkloadSettings
+
+        runtime = self.runtime()
+        runtime.settings = SimpleNamespace(table_count=5)
+        runtime._lock = Lock()
+        runtime._admission_generation = 0
+        runtime._admission = Mock()
+        current = WorkloadSettings(mode="target_rate_v1")
+        runtime.workload.settings.return_value = current
+        runtime.workload.running.return_value = True
+        runtime.workload.update.side_effect = lambda value: value
+
+        updated = runtime.update_workload({"active_target_tps": 12_000})
+        self.assertEqual(updated.active_target_tps, 12_000)
+        runtime._admission.reset.assert_called_once_with()
+
+        with self.assertRaisesRegex(RuntimeError, "restart writes"):
+            runtime.update_workload({"active_workers": 40})
+
 
 if __name__ == "__main__":
     unittest.main()

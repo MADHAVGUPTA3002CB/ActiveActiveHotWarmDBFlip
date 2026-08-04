@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "name": "d-e-quick",
+  "description": "Short harness smoke test for D and E; use the standard plan for analysis.",
+  "variants": ["D", "E"],
+  "target_tps": [100],
+  "repetitions": 1,
+  "random_seed": 20260803,
+  "table_count": 5,
+  "active_percent": 90,
+  "workload": {
+    "rows_per_transaction": 1,
+    "payload_bytes": 256,
+    "active_workers": 4,
+    "retiring_workers": 2,
+    "queue_limit_per_lane": 1000,
+    "rate_window_seconds": 3,
+    "minimum_achievement_percent": 5
+  },
+  "timing": {
+    "warmup_seconds": 5,
+    "measurement_seconds": 5,
+    "sample_interval_seconds": 1,
+    "final_healthy_samples": 2,
+    "flip_timeout_seconds": 180,
+    "restart_timeout_seconds": 900
+  },
+  "admission": {
+    "max_source_lag_bytes": 536870912,
+    "max_sink_lag_records_per_partition": 250000,
+    "stable_samples": 2,
+    "poll_ms": 50,
+    "park_budget_ms": 120000,
+    "revert_reserve_ms": 20000
+  },
+  "safety": {
+    "minimum_free_disk_gib": 5,
+    "stop_on_correctness_failure": true
+  }
+}

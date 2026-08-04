@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 .venv/
 .coverage
 __pycache__/
@@ -6,9 +8,16 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.tsbuildinfo
 results/*
 !results/.gitkeep
 playground-ui/node_modules/
 playground-ui/.next/
+playground-ui/.vinext/
 playground-ui/.wrangler/
+playground-ui/build/
 playground-ui/dist/

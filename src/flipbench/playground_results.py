@@ -12,6 +12,12 @@ def _non_negative_integer(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+def _non_negative_number(value: object) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return value
+
+
 def summarize_result(payload: Mapping[str, Any]) -> dict[str, Any]:
     try:
         run_id = str(uuid.UUID(str(payload["run_id"])))
@@ -41,6 +47,76 @@ def summarize_result(payload: Mapping[str, Any]) -> dict[str, Any]:
         profile = "unknown"
     scenario = payload.get("scenario")
     scenario = scenario if isinstance(scenario, Mapping) else {}
+    workload_mode = scenario.get("workload_mode")
+    if workload_mode not in ("legacy_batch", "target_rate_v1"):
+        workload_mode = None
+    workload_settings = scenario.get("workload_settings")
+    workload_settings = workload_settings if isinstance(workload_settings, Mapping) else {}
+    write_fence_mode = scenario.get(
+        "write_fence_mode", workload_settings.get("write_fence_mode")
+    )
+    if write_fence_mode not in (
+        "warm_tracker_advisory_v1",
+        "hot_transactional_v1",
+        "optimistic_detach_v1",
+    ):
+        write_fence_mode = "legacy/unknown"
+    transaction_shape = scenario.get("transaction_shape")
+    tables_per_transaction = scenario.get("tables_per_api_transaction")
+    optimistic_contract = scenario.get("optimistic_contract_version")
+    if (
+        write_fence_mode == "optimistic_detach_v1"
+        and optimistic_contract == "reserved_batch_first_write_admission_v3"
+        and transaction_shape == "api_batch_separate_commits_v1"
+    ):
+        pass
+    elif (
+        write_fence_mode == "optimistic_detach_v1"
+        and optimistic_contract == "batch_admission_separate_commits_v1"
+    ):
+        transaction_shape = "legacy_batch_admission_extra_transaction"
+    elif (
+        write_fence_mode == "optimistic_detach_v1"
+        and optimistic_contract == "batch_first_write_admission_v2"
+    ):
+        transaction_shape = "legacy_unreserved_batch_scheduler"
+    elif write_fence_mode == "optimistic_detach_v1" and tables_per_transaction == table_count:
+        transaction_shape = "legacy_all_tables_api"
+    elif write_fence_mode == "optimistic_detach_v1" and tables_per_transaction == 1:
+        transaction_shape = "legacy_per_transaction_gate_api"
+    elif transaction_shape in ("single_table_api", "api_batch_separate_commits_v1"):
+        pass
+    elif write_fence_mode == "hot_transactional_v1" and tables_per_transaction == 1:
+        transaction_shape = "single_table_api"
+    else:
+        transaction_shape = "legacy/unknown"
+    active_target = _non_negative_integer(workload_settings.get("active_target_tps"))
+    retiring_target = _non_negative_integer(workload_settings.get("retiring_target_tps"))
+    target_tps = (
+        active_target + retiring_target
+        if active_target is not None and retiring_target is not None
+        else None
+    )
+    achieved_tps = None
+    stable_window = scenario.get("stable_window")
+    if isinstance(stable_window, list):
+        for sample in reversed(stable_window):
+            if not isinstance(sample, Mapping):
+                continue
+            transactions = sample.get("transactions")
+            if isinstance(transactions, Mapping):
+                achieved_tps = _non_negative_number(transactions.get("achieved_tps"))
+                if achieved_tps is not None:
+                    break
+    topology = payload.get("topology")
+    topology = topology if isinstance(topology, Mapping) else {}
+    source_topology = (
+        payload.get("source_topology", topology.get("source_topology"))
+        if payload.get("schema_version") in (2, 3, 4)
+        else None
+    )
+    if source_topology not in ("shared", "isolated"):
+        source_topology = "legacy/unknown"
     generation_id = payload.get(
         "environment_generation_id", scenario.get("environment_generation_id")
     )
@@ -51,8 +127,47 @@ def summarize_result(payload: Mapping[str, Any]) -> dict[str, Any]:
         attempt_id = str(uuid.UUID(str(attempt_id)))
     except (ValueError, AttributeError):
         attempt_id = None
-    cell = payload.get("cell")
+    identity = payload.get("hot_identity")
+    identity = identity if isinstance(identity, Mapping) else {}
+    fence_wakeup = payload.get("fence_wakeup")
+    fence_wakeup = fence_wakeup if isinstance(fence_wakeup, Mapping) else {}
+    marker_fence = payload.get("marker_fence")
+    marker_fence = marker_fence if isinstance(marker_fence, Mapping) else {}
+    atomic_timings = marker_fence.get("atomic_transaction_ns_by_leaf")
+    atomic_detach_marker_ns = (
+        sum(atomic_timings.values())
+        if isinstance(atomic_timings, Mapping)
+        and atomic_timings
+        and all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in atomic_timings.values()
+        )
+        else None
+    )
+    parallel_wall_duration = marker_fence.get("parallel_wall_duration_ns")
+    parallel_detach_wall_ns = (
+        parallel_wall_duration
+        if isinstance(parallel_wall_duration, int)
+        and not isinstance(parallel_wall_duration, bool)
+        and parallel_wall_duration >= 0
+        else None
+    )
+    fence_wakeup_mode = fence_wakeup.get("mode")
+    if fence_wakeup_mode not in ("passive", "immediate_heartbeat"):
+        fence_wakeup_mode = "legacy/unknown"
+    fence_wakeup_applied = fence_wakeup.get("applied")
+    if not isinstance(fence_wakeup_applied, bool):
+        fence_wakeup_applied = None
+    cell = payload.get("cell", identity.get("cell"))
     timeslot = payload.get("timeslot")
+    source_proof_mode = scenario.get("source_proof_mode")
+    if source_proof_mode not in (
+        "slot_lsn_v1",
+        "per_leaf_marker_v1",
+        "atomic_detach_marker_v1",
+        "parallel_atomic_detach_marker_v1",
+    ):
+        source_proof_mode = "slot_lsn_v1" if payload.get("schema_version") in (1, 2, 3, 4) else "legacy/unknown"
     return {
         "artifact_type": artifact_type,
         "run_id": run_id,
@@ -63,11 +178,44 @@ def summarize_result(payload: Mapping[str, Any]) -> dict[str, Any]:
         "table_count": table_count,
         "profile": profile,
         "environment_generation_id": generation_id,
+        "source_topology": source_topology,
+        "fence_wakeup_mode": fence_wakeup_mode,
+        "fence_wakeup_applied": fence_wakeup_applied,
+        "source_proof_mode": source_proof_mode,
         "cell": cell if isinstance(cell, str) and len(cell) <= 64 else None,
         "timeslot": timeslot if isinstance(timeslot, str) and len(timeslot) <= 64 else None,
         "historical_saved_run": True,
+        "workload_mode": workload_mode,
+        "write_fence_mode": write_fence_mode,
+        "transaction_shape": transaction_shape,
+        "operations_per_api_batch": _non_negative_integer(
+            scenario.get("operations_per_api_batch")
+        ),
+        "ownership_reads_per_api_batch": _non_negative_integer(
+            scenario.get("ownership_reads_per_api_batch")
+        ),
+        "postgres_transactions_per_api_batch": _non_negative_integer(
+            scenario.get("postgres_transactions_per_api_batch")
+        ),
+        "target_tps": target_tps,
+        "achieved_tps": achieved_tps,
         "tracker_lock_ns": _non_negative_integer(durations.get("tracker_lock_ns")),
+        "hot_fence_park_ns": _non_negative_integer(
+            durations.get("hot_fence_park_ns")
+        ),
+        "admission_fence_ns": _non_negative_integer(
+            durations.get("admission_fence_ns")
+        ),
+        "in_flight_resolution_ns": _non_negative_integer(
+            durations.get("in_flight_resolution_ns")
+        ),
         "source_proof_ns": _non_negative_integer(durations.get("source_proof_ns")),
+        "atomic_detach_marker_ns": atomic_detach_marker_ns,
+        "parallel_detach_wall_ns": parallel_detach_wall_ns,
+        "fence_wakeup_ns": _non_negative_integer(durations.get("fence_wakeup_ns")),
+        "slot_wait_after_wakeup_ns": _non_negative_integer(
+            durations.get("slot_wait_after_wakeup_ns")
+        ),
         "capture_e_ns": _non_negative_integer(durations.get("capture_e_ns")),
         "sink_proof_ns": _non_negative_integer(durations.get("sink_proof_ns")),
         "grant_ns": _non_negative_integer(durations.get("grant_ns")),

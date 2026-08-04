@@ -8,7 +8,13 @@ from pathlib import Path
 
 from flipbench.playground_results import load_saved_runs, summarize_result
 from flipbench.results import write_ownership_checkpoint_atomic
-from tests.test_results import successful_result
+from tests.test_results import (
+    optimistic_detach_result,
+    successful_result,
+    v4_isolated_result,
+    v6_atomic_detach_marker_result,
+    v7_parallel_atomic_detach_marker_result,
+)
 
 
 def ownership_checkpoint(run_id: str) -> dict[str, object]:
@@ -35,7 +41,180 @@ def ownership_checkpoint(run_id: str) -> dict[str, object]:
     }
 
 
+def v2_ownership_checkpoint(run_id: str) -> dict[str, object]:
+    payload = ownership_checkpoint(run_id)
+    payload.update(
+        {
+            "schema_version": 2,
+            "source_topology": "isolated",
+            "source_connector_count": 2,
+            "fence_source_lane": "migration",
+            "fence_slot_name": "flipbench_slot_migration",
+            "fence_publication_name": "flipbench_pub_migration",
+            "fence_lsn": "1/0",
+            "hot_identity": {
+                "cell": "cell01",
+                "database": "cards",
+                "slot": "flipbench_slot_migration",
+                "system_identifier": "123456789",
+            },
+            "source_lane_evidence": {
+                stage: {
+                    lane: {
+                        "connector_state": "RUNNING",
+                        "connector_name": f"flipbench-source-{lane}",
+                        "task_states": ["RUNNING"],
+                        "slot_name": f"flipbench_slot_{lane}",
+                        "slot_active": True,
+                        "confirmed_lsn": "1/0",
+                        "restart_lsn": "0/10",
+                        "lag_bytes": 0,
+                    }
+                    for lane in ("active", "migration")
+                }
+                for stage in ("t1", "t5", "t7", "t13")
+            },
+        }
+    )
+    return payload
+
+
 class PlaygroundResultHistoryTests(unittest.TestCase):
+    def test_summarizes_variant_e_timing(self) -> None:
+        payload = successful_result()
+        payload["scenario"] = {"write_fence_mode": "optimistic_detach_v1"}
+        payload["durations_ns"] = {
+            "admission_fence_ns": 101,
+            "in_flight_resolution_ns": 202,
+        }
+        summary = summarize_result(payload)
+        self.assertEqual(summary["write_fence_mode"], "optimistic_detach_v1")
+        self.assertEqual(summary["admission_fence_ns"], 101)
+        self.assertEqual(summary["in_flight_resolution_ns"], 202)
+
+    def test_labels_old_all_table_variant_e_as_superseded_legacy_shape(self) -> None:
+        payload = optimistic_detach_result()
+        payload["scenario"].pop("optimistic_contract_version")
+        payload["scenario"].pop("transaction_shape")
+        payload["scenario"].pop("operations_per_api_batch")
+        payload["scenario"].pop("ownership_reads_per_api_batch")
+        payload["scenario"].pop("postgres_transactions_per_api_batch")
+        payload["scenario"].pop("api_batch_scheduling")
+        payload["scenario"].pop("partial_batch_completion_allowed")
+        payload["scenario"]["tables_per_api_transaction"] = 5
+        summary = summarize_result(payload)
+        self.assertEqual(summary["transaction_shape"], "legacy_all_tables_api")
+
+    def test_labels_current_variant_e_batch_admission_shape(self) -> None:
+        summary = summarize_result(optimistic_detach_result())
+        self.assertEqual(summary["transaction_shape"], "api_batch_separate_commits_v1")
+        self.assertEqual(summary["operations_per_api_batch"], 5)
+        self.assertEqual(summary["ownership_reads_per_api_batch"], 1)
+        self.assertEqual(summary["postgres_transactions_per_api_batch"], 5)
+
+    def test_summarizes_variant_g_atomic_detach_marker_time(self) -> None:
+        summary = summarize_result(v6_atomic_detach_marker_result())
+
+        self.assertEqual(summary["source_proof_mode"], "atomic_detach_marker_v1")
+        self.assertEqual(summary["atomic_detach_marker_ns"], 15)
+
+    def test_summarizes_variant_h_parallel_detach_wall_time(self) -> None:
+        summary = summarize_result(v7_parallel_atomic_detach_marker_result())
+
+        self.assertEqual(
+            summary["source_proof_mode"],
+            "parallel_atomic_detach_marker_v1",
+        )
+        self.assertEqual(summary["parallel_detach_wall_ns"], 5)
+
+    def test_labels_previous_per_transaction_gate_e_as_superseded(self) -> None:
+        payload = optimistic_detach_result()
+        payload["scenario"].pop("optimistic_contract_version")
+        payload["scenario"].pop("operations_per_api_batch")
+        payload["scenario"].pop("ownership_reads_per_api_batch")
+        payload["scenario"].pop("postgres_transactions_per_api_batch")
+        payload["scenario"].pop("api_batch_scheduling")
+        payload["scenario"].pop("partial_batch_completion_allowed")
+        payload["scenario"]["transaction_shape"] = "single_table_api"
+        summary = summarize_result(payload)
+        self.assertEqual(
+            summary["transaction_shape"], "legacy_per_transaction_gate_api"
+        )
+
+    def test_labels_standalone_batch_admission_transaction_as_superseded(self) -> None:
+        payload = optimistic_detach_result()
+        payload["scenario"]["optimistic_contract_version"] = (
+            "batch_admission_separate_commits_v1"
+        )
+        payload["scenario"]["postgres_transactions_per_api_batch"] = 6
+        summary = summarize_result(payload)
+        self.assertEqual(
+            summary["transaction_shape"],
+            "legacy_batch_admission_extra_transaction",
+        )
+
+    def test_labels_unreserved_batch_scheduler_as_superseded(self) -> None:
+        payload = optimistic_detach_result()
+        payload["scenario"]["optimistic_contract_version"] = (
+            "batch_first_write_admission_v2"
+        )
+        payload["scenario"].pop("api_batch_scheduling")
+        summary = summarize_result(payload)
+        self.assertEqual(
+            summary["transaction_shape"], "legacy_unreserved_batch_scheduler"
+        )
+
+    def test_labels_variant_d_one_table_transaction_shape(self) -> None:
+        payload = successful_result()
+        payload["scenario"] = {
+            "write_fence_mode": "hot_transactional_v1",
+            "tables_per_api_transaction": 1,
+        }
+        summary = summarize_result(payload)
+        self.assertEqual(summary["transaction_shape"], "single_table_api")
+
+    def test_summarizes_target_and_achieved_tps(self) -> None:
+        payload = successful_result()
+        payload["scenario"] = {
+            "mode": "production-shaped",
+            "workload_mode": "target_rate_v1",
+            "workload_settings": {
+                "active_target_tps": 13_636,
+                "retiring_target_tps": 1_364,
+            },
+            "stable_window": [
+                {"transactions": {"achieved_tps": 14_250.0}}
+            ],
+        }
+        summary = summarize_result(payload)
+        self.assertEqual(summary["target_tps"], 15_000)
+        self.assertEqual(summary["achieved_tps"], 14_250.0)
+        self.assertEqual(summary["workload_mode"], "target_rate_v1")
+
+    def test_schema_v2_checkpoint_enforces_topology_provenance(self) -> None:
+        run_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / run_id / "ownership-grant.json"
+            write_ownership_checkpoint_atomic(path, v2_ownership_checkpoint(run_id))
+
+        invalid = v2_ownership_checkpoint(run_id)
+        invalid["fence_source_lane"] = "shared"
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(
+            ValueError, "fence lane"
+        ):
+            write_ownership_checkpoint_atomic(
+                Path(directory) / run_id / "ownership-grant.json", invalid
+            )
+
+        incomplete_identity = v2_ownership_checkpoint(run_id)
+        incomplete_identity["hot_identity"] = None
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(
+            ValueError, "hot identity"
+        ):
+            write_ownership_checkpoint_atomic(
+                Path(directory) / run_id / "ownership-grant.json", incomplete_identity
+            )
+
     def test_checkpoint_writer_is_atomic_and_requires_non_authoritative_t13(self) -> None:
         run_id = str(uuid.uuid4())
         attempt_id = str(uuid.uuid4())
@@ -125,6 +304,7 @@ class PlaygroundResultHistoryTests(unittest.TestCase):
         self.assertEqual(summary["run_id"], run_id)
         self.assertEqual(summary["verification_outcome"], "pending")
         self.assertEqual(summary["source_lag_bytes"], 9)
+        self.assertEqual(summary["source_topology"], "legacy/unknown")
 
     def test_preserves_revert_timing_semantics(self) -> None:
         payload = successful_result()
@@ -143,6 +323,30 @@ class PlaygroundResultHistoryTests(unittest.TestCase):
         summary = summarize_result(payload)
         self.assertEqual(summary["forward_until_failure_ns"], 3_800_000_000)
         self.assertEqual(summary["revert_ns"], 6_000_000)
+
+    def test_summary_preserves_fence_wakeup_experiment_metadata(self) -> None:
+        payload = successful_result()
+        payload["fence_wakeup"] = {
+            "mode": "immediate_heartbeat",
+            "applied": True,
+            "duration_ns": 2_000_000,
+        }
+        payload["durations_ns"] = {
+            "fence_wakeup_ns": 3_000_000,
+            "slot_wait_after_wakeup_ns": 7_000_000,
+        }
+        summary = summarize_result(payload)
+        self.assertEqual(summary["fence_wakeup_mode"], "immediate_heartbeat")
+        self.assertIs(summary["fence_wakeup_applied"], True)
+        self.assertEqual(summary["fence_wakeup_ns"], 3_000_000)
+        self.assertEqual(summary["slot_wait_after_wakeup_ns"], 7_000_000)
+
+        legacy = summarize_result(successful_result())
+        self.assertEqual(legacy["fence_wakeup_mode"], "legacy/unknown")
+        self.assertIsNone(legacy["fence_wakeup_applied"])
+
+        v4_summary = summarize_result(v4_isolated_result())
+        self.assertEqual(v4_summary["source_topology"], "isolated")
 
     def test_ignores_malformed_or_oversized_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

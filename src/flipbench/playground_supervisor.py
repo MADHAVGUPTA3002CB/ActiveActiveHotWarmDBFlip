@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import subprocess
@@ -20,6 +21,7 @@ from .playground_results import load_saved_runs
 
 
 SUPPORTED_TABLE_COUNTS = (5, 10, 15, 20)
+SUPPORTED_SOURCE_TOPOLOGIES = ("shared", "isolated")
 CommandRunner = Callable[[tuple[str, ...], Path], str]
 CONTROL_API_RECOVERY_HINT = (
     "From the prototype directory, run `make playground-api-rf3 "
@@ -45,6 +47,7 @@ class RestartBlockedError(RuntimeError):
 class RestartRequest:
     table_count: int
     confirmation: str
+    source_topology: str = "shared"
 
     def __post_init__(self) -> None:
         if (
@@ -55,27 +58,42 @@ class RestartRequest:
             raise ValueError("table_count must be one of 5, 10, 15, or 20")
         if self.confirmation != "RESET":
             raise ValueError("type RESET exactly to confirm deletion of local benchmark volumes")
+        if self.source_topology not in SUPPORTED_SOURCE_TOPOLOGIES:
+            raise ValueError("source_topology must be shared or isolated")
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> RestartRequest:
-        if set(payload) != {"table_count", "confirmation"}:
-            raise ValueError("restart body must contain only table_count and confirmation")
-        return cls(payload["table_count"], payload["confirmation"])
+        if set(payload) not in (
+            {"table_count", "confirmation"},
+            {"table_count", "source_topology", "confirmation"},
+        ):
+            raise ValueError(
+                "restart body must contain only table_count, source_topology and confirmation"
+            )
+        return cls(
+            payload["table_count"],
+            payload["confirmation"],
+            payload.get("source_topology", "shared"),
+        )
 
 
 def restart_commands(
-    table_count: int, environment_generation_id: str | None = None
+    table_count: int,
+    environment_generation_id: str | None = None,
+    *,
+    source_topology: str = "shared",
 ) -> tuple[tuple[str, ...], ...]:
-    RestartRequest(table_count, "RESET")
+    RestartRequest(table_count, "RESET", source_topology)
     count = f"TABLE_COUNT={table_count}"
-    api_command = ["make", "playground-api-rf3", count]
+    topology = f"SOURCE_TOPOLOGY={source_topology}"
+    api_command = ["make", "playground-api-rf3", count, topology]
     if environment_generation_id is not None:
         uuid.UUID(environment_generation_id)
         api_command.append(f"PLAYGROUND_ENVIRONMENT_GENERATION_ID={environment_generation_id}")
     return (
         ("make", "reset-rf3"),
         ("make", "up-rf3"),
-        ("make", "setup-rf3", count),
+        ("make", "setup-rf3", count, topology),
         tuple(api_command),
     )
 
@@ -212,7 +230,7 @@ def _default_safety_probe(results_dir: Path) -> str:
 
 
 def _readiness_failures(
-    state: Mapping[str, Any], table_count: int, generation_id: str
+    state: Mapping[str, Any], table_count: int, generation_id: str, source_topology: str = "shared"
 ) -> tuple[str, ...]:
     environment = state.get("environment", {})
     latest = state.get("latest", {})
@@ -226,22 +244,35 @@ def _readiness_failures(
         or environment.get("environment_generation_id") != generation_id
     ):
         failures.append("environment generation does not match the restart job")
+    if (
+        not isinstance(environment, Mapping)
+        or environment.get("source_topology") != source_topology
+    ):
+        failures.append("source topology does not match the restart job")
     if not isinstance(tracker, Mapping) or tracker.get("retiring") != "hot_primary":
         failures.append("retiring ownership is not hot_primary")
-    if connectors != {"source": "RUNNING", "sink": "RUNNING"}:
+    if (
+        not isinstance(connectors, Mapping)
+        or connectors.get("source") != "RUNNING"
+        or connectors.get("sink") != "RUNNING"
+    ):
         failures.append("connectors are not both RUNNING")
     if state.get("metrics_error") is not None:
         failures.append("metrics are not healthy")
     return tuple(failures)
 
 
-def _default_verifier(table_count: int, generation_id: str) -> str:
+def _default_verifier(
+    table_count: int, generation_id: str, source_topology: str = "shared"
+) -> str:
     deadline = time.monotonic() + 90
     last_error = "playground API unavailable"
     while time.monotonic() < deadline:
         try:
             state = _api_json("GET", "/api/state")
-            failures = _readiness_failures(state, table_count, generation_id)
+            failures = _readiness_failures(
+                state, table_count, generation_id, source_topology
+            )
             if not failures:
                 return "Fresh API, hot ownership, connector tasks and metrics verified."
             last_error = "; ".join(failures)
@@ -257,7 +288,7 @@ class RestartCoordinator:
         project_dir: Path,
         command_runner: CommandRunner = _run_command,
         safety_probe: Callable[[Path], str] = _default_safety_probe,
-        verifier: Callable[[int, str], str] = _default_verifier,
+        verifier: Callable[..., str] = _default_verifier,
     ) -> None:
         self._project_dir = project_dir.resolve()
         self._command_runner = command_runner
@@ -273,6 +304,7 @@ class RestartCoordinator:
             "job_id": None,
             "environment_generation_id": None,
             "table_count": None,
+            "source_topology": None,
             "started_at_utc": None,
             "finished_at_utc": None,
             "error": None,
@@ -301,6 +333,7 @@ class RestartCoordinator:
                 "job_id": str(uuid.uuid4()),
                 "environment_generation_id": None,
                 "table_count": request.table_count,
+                "source_topology": request.source_topology,
                 "started_at_utc": datetime.now(timezone.utc).isoformat(),
                 "finished_at_utc": None,
                 "error": None,
@@ -324,15 +357,68 @@ class RestartCoordinator:
             self._replace(phase="Validating current experiment", step=1)
             probe_output = self._safety_probe(self._project_dir / "results")
             self._replace(logs=[probe_output])
-            for index, (phase, command) in enumerate(
-                zip(phases, restart_commands(request.table_count, generation_id)), start=2
+            commands = restart_commands(
+                request.table_count,
+                generation_id,
+                source_topology=request.source_topology,
+            )
+            for position, (phase, command) in enumerate(
+                zip(phases, commands),
             ):
+                index = position + 2
                 self._replace(phase=phase, step=index)
-                output = self._command_runner(command, self._project_dir)
+                try:
+                    output = self._command_runner(command, self._project_dir)
+                except Exception as setup_error:
+                    if position != 2:
+                        raise
+                    snapshot = self.snapshot()
+                    self._replace(
+                        phase="Retrying clean topology setup",
+                        logs=[
+                            *snapshot["logs"],
+                            f"First topology setup failed: {setup_error}",
+                        ][-4:],
+                    )
+                    retry_outputs: list[str] = []
+                    for retry_position in range(3):
+                        self._replace(
+                            phase=f"Retry: {phases[retry_position]}",
+                            step=retry_position + 2,
+                        )
+                        retry_outputs.append(
+                            self._command_runner(
+                                commands[retry_position], self._project_dir
+                            )
+                        )
+                    output = "\n".join(retry_outputs)
                 snapshot = self.snapshot()
                 self._replace(logs=[*snapshot["logs"], output[-2000:]][-4:])
             self._replace(phase="Verifying fresh environment", step=6)
-            verification = self._verifier(request.table_count, generation_id)
+            try:
+                parameters = tuple(inspect.signature(self._verifier).parameters.values())
+            except (TypeError, ValueError):
+                supports_topology = True
+            else:
+                supports_topology = any(
+                    parameter.kind == inspect.Parameter.VAR_POSITIONAL
+                    for parameter in parameters
+                ) or len(
+                    tuple(
+                        parameter
+                        for parameter in parameters
+                        if parameter.kind
+                        in (
+                            inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        )
+                    )
+                ) >= 3
+            verification = (
+                self._verifier(request.table_count, generation_id, request.source_topology)
+                if supports_topology
+                else self._verifier(request.table_count, generation_id)
+            )
             snapshot = self.snapshot()
             self._replace(logs=[*snapshot["logs"], verification][-4:])
         except BaseException as error:

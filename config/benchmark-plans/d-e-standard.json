@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "name": "d-e-standard",
+  "description": "Balanced three-repetition screening of the shared-lock hot fence (D) and optimistic detach contract (E) around the measured local capacity knee.",
+  "variants": ["D", "E"],
+  "target_tps": [250, 500, 1000, 2000, 3000, 4000],
+  "repetitions": 3,
+  "random_seed": 20260803,
+  "table_count": 5,
+  "active_percent": 90,
+  "workload": {
+    "rows_per_transaction": 1,
+    "payload_bytes": 256,
+    "active_workers": 32,
+    "retiring_workers": 8,
+    "queue_limit_per_lane": 5000,
+    "rate_window_seconds": 5,
+    "minimum_achievement_percent": 5
+  },
+  "timing": {
+    "warmup_seconds": 15,
+    "measurement_seconds": 15,
+    "sample_interval_seconds": 1,
+    "final_healthy_samples": 5,
+    "flip_timeout_seconds": 180,
+    "restart_timeout_seconds": 900
+  },
+  "admission": {
+    "max_source_lag_bytes": 536870912,
+    "max_sink_lag_records_per_partition": 250000,
+    "stable_samples": 6,
+    "poll_ms": 50,
+    "park_budget_ms": 120000,
+    "revert_reserve_ms": 20000
+  },
+  "safety": {
+    "minimum_free_disk_gib": 15,
+    "stop_on_correctness_failure": true
+  }
+}

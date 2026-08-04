@@ -5,6 +5,7 @@ import hashlib
 import hmac
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from .core import ManifestError
 
@@ -25,8 +26,10 @@ class Settings:
     slot_name: str = "flipbench_slot"
     publication_name: str = "flipbench_pub"
     source_connector: str = "flipbench-source"
+    source_topology: str = "shared"
     source_database_user: str = "flipbench_cdc"
     sink_database_user: str = "flipbench_sink"
+    writer_database_user: str = "flipbench_writer"
     results_dir: Path = Path("results")
     connect_offset_flush_interval_ms: int = 1000
     connect_offset_flush_timeout_ms: int = 5000
@@ -63,6 +66,26 @@ class Settings:
             self.postgres_password, self.sink_database_user
         )
 
+    @property
+    def writer_database_password(self) -> str:
+        return self._local_role_password(self.postgres_password, self.writer_database_user)
+
+    @property
+    def writer_hot_dsn(self) -> str:
+        parsed = urlsplit(self.hot_dsn)
+        if parsed.scheme not in ("postgres", "postgresql") or parsed.hostname is None:
+            raise ManifestError("HOT_DSN must be a PostgreSQL URI to derive the local writer DSN")
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = "" if parsed.port is None else f":{parsed.port}"
+        credentials = (
+            f"{quote(self.writer_database_user, safe='')}:{quote(self.writer_database_password, safe='')}@"
+        )
+        return urlunsplit(
+            (parsed.scheme, f"{credentials}{host}{port}", parsed.path, parsed.query, parsed.fragment)
+        )
+
     @classmethod
     def from_env(cls, table_count: int | None = None) -> "Settings":
         required = {
@@ -83,6 +106,9 @@ class Settings:
         resolved_count = table_count if table_count is not None else int(os.environ.get("TABLE_COUNT", "5"))
         if resolved_count not in (5, 10, 15, 20):
             raise ManifestError("TABLE_COUNT must be one of 5, 10, 15, or 20")
+        source_topology = os.environ.get("SOURCE_TOPOLOGY", "shared")
+        if source_topology not in ("shared", "isolated"):
+            raise ManifestError("SOURCE_TOPOLOGY must be shared or isolated")
 
         def positive_int(name: str, default: int) -> int:
             try:
@@ -116,6 +142,7 @@ class Settings:
             cdc_password=os.environ.get("CDC_PASSWORD") or None,
             sink_password=os.environ.get("SINK_PASSWORD") or None,
             results_dir=Path(os.environ.get("RESULTS_DIR", "results")),
+            source_topology=source_topology,
             connect_offset_flush_interval_ms=positive_int("CONNECT_OFFSET_FLUSH_INTERVAL_MS", 1000),
             connect_offset_flush_timeout_ms=positive_int("CONNECT_OFFSET_FLUSH_TIMEOUT_MS", 5000),
             connect_internal_topic_replication_factor=positive_int(
@@ -143,7 +170,10 @@ class Settings:
             configured.postgres_password,
             configured.source_database_password,
             configured.sink_database_password,
+            configured.writer_database_password,
         }
-        if len(passwords) != 3:
-            raise ManifestError("POSTGRES_PASSWORD, CDC_PASSWORD and SINK_PASSWORD must be distinct")
+        if len(passwords) != 4:
+            raise ManifestError(
+                "POSTGRES_PASSWORD and derived CDC, sink and writer passwords must be distinct"
+            )
         return configured

@@ -5,6 +5,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from threading import Thread
 from unittest.mock import Mock, patch
@@ -25,26 +26,63 @@ from flipbench.playground_supervisor import (
 
 class RestartRequestTests(unittest.TestCase):
     def test_requires_exact_confirmation_and_supported_table_count(self) -> None:
-        request = RestartRequest.from_payload({"table_count": 10, "confirmation": "RESET"})
+        request = RestartRequest.from_payload(
+            {"table_count": 10, "source_topology": "isolated", "confirmation": "RESET"}
+        )
         self.assertEqual(request.table_count, 10)
+        self.assertEqual(request.source_topology, "isolated")
         for payload in (
-            {"table_count": 7, "confirmation": "RESET"},
-            {"table_count": 5, "confirmation": "reset"},
-            {"table_count": True, "confirmation": "RESET"},
-            {"table_count": 5, "confirmation": "RESET", "command": "rm"},
+            {"table_count": 7, "source_topology": "shared", "confirmation": "RESET"},
+            {"table_count": 5, "source_topology": "shared", "confirmation": "reset"},
+            {"table_count": True, "source_topology": "shared", "confirmation": "RESET"},
+            {"table_count": 5, "source_topology": "per-table", "confirmation": "RESET"},
+            {"table_count": 5, "source_topology": "shared", "confirmation": "RESET", "command": "rm"},
         ):
             with self.subTest(payload=payload), self.assertRaises(ValueError):
                 RestartRequest.from_payload(payload)
 
     def test_restart_commands_are_fixed_and_scoped(self) -> None:
-        commands = restart_commands(15)
+        commands = restart_commands(15, source_topology="isolated")
         self.assertEqual(commands[0], ("make", "reset-rf3"))
         self.assertEqual(commands[1], ("make", "up-rf3"))
-        self.assertEqual(commands[2], ("make", "setup-rf3", "TABLE_COUNT=15"))
-        self.assertEqual(commands[3], ("make", "playground-api-rf3", "TABLE_COUNT=15"))
+        self.assertEqual(
+            commands[2],
+            ("make", "setup-rf3", "TABLE_COUNT=15", "SOURCE_TOPOLOGY=isolated"),
+        )
+        self.assertEqual(
+            commands[3],
+            ("make", "playground-api-rf3", "TABLE_COUNT=15", "SOURCE_TOPOLOGY=isolated"),
+        )
+
+    def test_restart_commands_preserve_legacy_positional_generation_argument(self) -> None:
+        generation_id = str(uuid.uuid4())
+        commands = restart_commands(5, generation_id)
+        self.assertIn(f"PLAYGROUND_ENVIRONMENT_GENERATION_ID={generation_id}", commands[3])
+        self.assertIn("SOURCE_TOPOLOGY=shared", commands[3])
 
 
 class RestartCoordinatorTests(unittest.TestCase):
+    def test_accepts_existing_two_argument_verifier_callbacks(self) -> None:
+        verified: list[tuple[int, str]] = []
+
+        def verifier(table_count: int, generation_id: str) -> str:
+            verified.append((table_count, generation_id))
+            return "ready"
+
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator = RestartCoordinator(
+                Path(directory),
+                command_runner=lambda _command, _path: "ok",
+                safety_probe=lambda _: "safe",
+                verifier=verifier,
+            )
+            coordinator.start(RestartRequest(5, "RESET", "isolated"))
+            deadline = time.monotonic() + 1
+            while coordinator.snapshot()["status"] == "running" and time.monotonic() < deadline:
+                time.sleep(0.002)
+            state = coordinator.snapshot()
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(verified[0][0], 5)
     def test_current_ownership_checkpoint_requires_matching_identity(self) -> None:
         saved = [
             {"run_id": "old", "attempt_id": "attempt-old", "outcome": "success"},
@@ -68,7 +106,7 @@ class RestartCoordinatorTests(unittest.TestCase):
                 Path(directory),
                 command_runner=run,
                 safety_probe=lambda _: "safe",
-                verifier=lambda _count, _generation: "ready",
+                verifier=lambda _count, _generation, _topology: "ready",
             )
             coordinator.start(RestartRequest(5, "RESET"))
             with self.assertRaises(RuntimeError):
@@ -80,7 +118,7 @@ class RestartCoordinatorTests(unittest.TestCase):
         self.assertEqual(state["status"], "completed")
         self.assertEqual(state["step"], 6)
         self.assertEqual(observed[:3], list(restart_commands(5))[:3])
-        self.assertEqual(observed[3][:3], restart_commands(5)[3])
+        self.assertEqual(observed[3][:4], restart_commands(5)[3])
 
     def test_fails_closed_when_a_fixed_step_errors(self) -> None:
         def fail(_: tuple[str, ...], __: Path) -> str:
@@ -91,7 +129,7 @@ class RestartCoordinatorTests(unittest.TestCase):
                 Path(directory),
                 command_runner=fail,
                 safety_probe=lambda _: "safe",
-                verifier=lambda _count, _generation: "ready",
+                verifier=lambda _count, _generation, _topology: "ready",
             )
             coordinator.start(RestartRequest(5, "RESET"))
             deadline = time.monotonic() + 1
@@ -100,6 +138,40 @@ class RestartCoordinatorTests(unittest.TestCase):
             state = coordinator.snapshot()
         self.assertEqual(state["status"], "failed")
         self.assertIn("compose failed", str(state["error"]))
+
+    def test_retries_the_full_scoped_reset_once_after_topology_setup_fails(self) -> None:
+        commands = restart_commands(5, source_topology="isolated")
+        observed: list[tuple[str, ...]] = []
+        setup_attempts = 0
+
+        def run(command: tuple[str, ...], _: Path) -> str:
+            nonlocal setup_attempts
+            observed.append(command)
+            if command == commands[2]:
+                setup_attempts += 1
+                if setup_attempts == 1:
+                    raise RuntimeError("transient topology setup failure")
+            return "ok"
+
+        with tempfile.TemporaryDirectory() as directory:
+            coordinator = RestartCoordinator(
+                Path(directory),
+                command_runner=run,
+                safety_probe=lambda _: "safe",
+                verifier=lambda _count, _generation, _topology: "ready",
+            )
+            coordinator.start(RestartRequest(5, "RESET", "isolated"))
+            deadline = time.monotonic() + 1
+            while coordinator.snapshot()["status"] == "running" and time.monotonic() < deadline:
+                time.sleep(0.002)
+            state = coordinator.snapshot()
+
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(
+            observed[:6],
+            [commands[0], commands[1], commands[2], commands[0], commands[1], commands[2]],
+        )
+        self.assertEqual(observed[6][:4], commands[3])
 
     def test_exposes_structured_actionable_safety_failure_without_python_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -210,7 +282,11 @@ class SupervisorSafetyTests(unittest.TestCase):
 
     def test_verifier_accepts_only_fresh_ready_environment(self) -> None:
         ready = {
-            "environment": {"table_count": 10, "environment_generation_id": "generation"},
+            "environment": {
+                "table_count": 10,
+                "environment_generation_id": "generation",
+                "source_topology": "shared",
+            },
             "latest": {"tracker_states": {"retiring": "hot_primary"}},
             "connectors": {"source": "RUNNING", "sink": "RUNNING"},
             "metrics_error": None,
@@ -220,7 +296,11 @@ class SupervisorSafetyTests(unittest.TestCase):
 
     def test_verifier_retries_a_transient_not_ready_response(self) -> None:
         ready = {
-            "environment": {"table_count": 10, "environment_generation_id": "generation"},
+            "environment": {
+                "table_count": 10,
+                "environment_generation_id": "generation",
+                "source_topology": "shared",
+            },
             "latest": {"tracker_states": {"retiring": "hot_primary"}},
             "connectors": {"source": "RUNNING", "sink": "RUNNING"},
             "metrics_error": None,
@@ -246,7 +326,7 @@ class SupervisorHttpTests(unittest.TestCase):
             Path(self.temp.name),
             command_runner=lambda _command, _directory: "ok",
             safety_probe=lambda _directory: "safe",
-            verifier=lambda _count, _generation: "ready",
+            verifier=lambda _count, _generation, _topology: "ready",
         )
         SupervisorHandler.coordinator = self.coordinator
         SupervisorHandler.results_dir = Path(self.temp.name)

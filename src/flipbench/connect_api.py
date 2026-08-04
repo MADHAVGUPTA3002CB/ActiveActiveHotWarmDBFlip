@@ -30,7 +30,21 @@ class ConnectClient:
     base_url: str
     timeout_seconds: float = 10.0
 
-    def _request(self, method: str, path: str, body: Mapping[str, Any] | None = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: Mapping[str, Any] | None = None,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Any:
+        effective_timeout = (
+            self.timeout_seconds
+            if timeout_seconds is None
+            else min(self.timeout_seconds, timeout_seconds)
+        )
+        if effective_timeout <= 0:
+            raise ConnectError(f"Connect {method} {path} has no request-time budget")
         encoded = None if body is None else json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}{path}",
@@ -39,7 +53,7 @@ class ConnectClient:
             headers={"Accept": "application/json", "Content-Type": "application/json"},
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            with urllib.request.urlopen(request, timeout=effective_timeout) as response:
                 payload = response.read()
         except urllib.error.HTTPError as error:
             detail = redact_error_detail(error.read().decode("utf-8", errors="replace"))
@@ -62,33 +76,58 @@ class ConnectClient:
             if "HTTP 404" not in str(error):
                 raise
 
-    def status(self, connector: str) -> Mapping[str, Any]:
-        return self._request("GET", f"/connectors/{connector}/status")
+    def status(
+        self, connector: str, *, timeout_seconds: float | None = None
+    ) -> Mapping[str, Any]:
+        return self._request(
+            "GET",
+            f"/connectors/{connector}/status",
+            timeout_seconds=timeout_seconds,
+        )
 
-    def config(self, connector: str) -> Mapping[str, str]:
-        return self._request("GET", f"/connectors/{connector}/config")
+    def config(
+        self, connector: str, *, timeout_seconds: float | None = None
+    ) -> Mapping[str, str]:
+        return self._request(
+            "GET",
+            f"/connectors/{connector}/config",
+            timeout_seconds=timeout_seconds,
+        )
 
-    def set_paused(self, connector: str, paused: bool) -> None:
+    def set_paused(
+        self,
+        connector: str,
+        paused: bool,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
         action = "pause" if paused else "resume"
-        self._request("PUT", f"/connectors/{connector}/{action}")
+        self._request(
+            "PUT",
+            f"/connectors/{connector}/{action}",
+            timeout_seconds=timeout_seconds,
+        )
 
     def wait_state(self, connector: str, expected: str, deadline_seconds: float = 60.0) -> None:
         deadline = time.monotonic() + deadline_seconds
         last: Mapping[str, Any] | None = None
         while time.monotonic() < deadline:
             try:
-                last = self.status(connector)
+                last = self.status(
+                    connector,
+                    timeout_seconds=max(0.001, deadline - time.monotonic()),
+                )
             except ConnectError as error:
                 # Connect can acknowledge PUT /config before the distributed
                 # status backing store exposes the new connector.
                 if "HTTP 404" not in str(error):
                     raise
-                time.sleep(0.25)
+                time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
                 continue
             connector_state = str(last.get("connector", {}).get("state", ""))
             task_states = tuple(str(task.get("state", "")) for task in last.get("tasks", ()))
             tasks_match = bool(task_states) and all(state == expected for state in task_states)
             if connector_state == expected and tasks_match:
                 return
-            time.sleep(0.25)
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
         raise ConnectError(f"connector {connector} did not reach {expected}; last status={last!r}")

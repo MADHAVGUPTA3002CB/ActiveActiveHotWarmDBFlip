@@ -5,7 +5,7 @@ import json
 import uuid
 
 from .bootstrap import bootstrap
-from .core import build_manifest, canonical_manifest_json
+from .core import FenceWakeupMode, build_manifest, canonical_manifest_json
 from .flip import FlipRunner
 from .postgres_io import guarded_insert_events
 from .scenario import prepare_paused_backlog, prepare_production_workload, prepare_running_overload
@@ -41,6 +41,11 @@ def parser() -> argparse.ArgumentParser:
     flip.add_argument("--timeout-seconds", type=float, default=120.0)
     flip.add_argument("--poll-ms", type=float, default=100.0)
     flip.add_argument("--resume-paused", action="store_true")
+    flip.add_argument(
+        "--fence-wakeup-mode",
+        choices=tuple(mode.value for mode in FenceWakeupMode),
+        default=FenceWakeupMode.PASSIVE.value,
+    )
 
     benchmark = subcommands.add_parser("benchmark", help="prepare paused non-zero lag and immediately run one flip")
     benchmark.add_argument("--tables", type=int, choices=(5, 10, 15, 20), default=None)
@@ -49,6 +54,11 @@ def parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--payload-bytes", type=int, default=512)
     benchmark.add_argument("--timeout-seconds", type=float, default=120.0)
     benchmark.add_argument("--poll-ms", type=float, default=100.0)
+    benchmark.add_argument(
+        "--fence-wakeup-mode",
+        choices=tuple(mode.value for mode in FenceWakeupMode),
+        default=FenceWakeupMode.PASSIVE.value,
+    )
 
     running = subcommands.add_parser(
         "benchmark-running",
@@ -66,6 +76,11 @@ def parser() -> argparse.ArgumentParser:
     running.add_argument("--admission-timeout-seconds", type=float, default=30.0)
     running.add_argument("--timeout-seconds", type=float, default=120.0)
     running.add_argument("--poll-ms", type=float, default=50.0)
+    running.add_argument(
+        "--fence-wakeup-mode",
+        choices=tuple(mode.value for mode in FenceWakeupMode),
+        default=FenceWakeupMode.PASSIVE.value,
+    )
 
     prodlike = subcommands.add_parser(
         "benchmark-prodlike",
@@ -85,6 +100,11 @@ def parser() -> argparse.ArgumentParser:
     prodlike.add_argument("--park-budget-ms", type=float, default=200.0)
     prodlike.add_argument("--revert-reserve-ms", type=float, default=50.0)
     prodlike.add_argument("--poll-ms", type=float, default=5.0)
+    prodlike.add_argument(
+        "--fence-wakeup-mode",
+        choices=tuple(mode.value for mode in FenceWakeupMode),
+        default=FenceWakeupMode.PASSIVE.value,
+    )
     return command
 
 
@@ -121,7 +141,13 @@ def main() -> None:
         )
         print(json.dumps({"run_id": str(prepared.run_id), "sink_events": prepared.sink_events, "source_events": prepared.source_events, "source_lag_bytes": prepared.source_lag_bytes}, sort_keys=True))
     elif args.command == "flip":
-        result = FlipRunner(settings, args.run_id, args.timeout_seconds, args.poll_ms / 1000).run(args.resume_paused)
+        result = FlipRunner(
+            settings,
+            args.run_id,
+            args.timeout_seconds,
+            args.poll_ms / 1000,
+            fence_wakeup_mode=args.fence_wakeup_mode,
+        ).run(args.resume_paused)
         print(json.dumps({"outcome": result["outcome"], "run_id": result["run_id"], "writer_park_ns": result["durations_ns"]["writer_park_ns"]}, sort_keys=True))
     elif args.command == "benchmark":
         prepared = prepare_paused_backlog(
@@ -131,7 +157,13 @@ def main() -> None:
             args.source_events_per_table,
             args.payload_bytes,
         )
-        result = FlipRunner(settings, prepared.run_id, args.timeout_seconds, args.poll_ms / 1000).run(True)
+        result = FlipRunner(
+            settings,
+            prepared.run_id,
+            args.timeout_seconds,
+            args.poll_ms / 1000,
+            fence_wakeup_mode=args.fence_wakeup_mode,
+        ).run(True)
         print(json.dumps({"outcome": result["outcome"], "run_id": result["run_id"], "writer_park_ns": result["durations_ns"]["writer_park_ns"]}, sort_keys=True))
     elif args.command == "benchmark-running":
         overload = prepare_running_overload(
@@ -160,6 +192,7 @@ def main() -> None:
                 overload.stop_and_join,
                 overload.writer.total_inserted,
                 overload.writer.is_alive,
+                fence_wakeup_mode=args.fence_wakeup_mode,
             ).run(False, require_nonzero_lag=True)
         except BaseException as error:
             flip_error = error
@@ -223,6 +256,7 @@ def main() -> None:
                 workload.writers.active_total,
                 workload.writers.active_is_alive,
                 recovery_timeout_seconds=args.revert_reserve_ms / 1000,
+                fence_wakeup_mode=args.fence_wakeup_mode,
             ).run(False)
         except BaseException as error:
             flip_error = error

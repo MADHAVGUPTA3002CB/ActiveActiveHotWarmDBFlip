@@ -6,6 +6,32 @@ from queue import Empty, SimpleQueue
 from threading import Event, Lock, Thread
 from typing import Callable, Mapping
 
+from .core import FenceWakeupMode, SourceProofMode, WriteFenceMode
+from .traffic import TrafficLane, TrafficSnapshot, TrafficTarget, TrafficWorker
+
+
+@dataclass(frozen=True, slots=True)
+class FlipStartRequest:
+    fence_wakeup_mode: FenceWakeupMode = FenceWakeupMode.PASSIVE
+    source_proof_mode: SourceProofMode = SourceProofMode.SLOT_LSN
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> FlipStartRequest:
+        if set(payload) - {"fence_wakeup_mode", "source_proof_mode"}:
+            raise ValueError("flip body contains an unknown option")
+        value = payload.get("fence_wakeup_mode", FenceWakeupMode.PASSIVE.value)
+        proof = payload.get("source_proof_mode", SourceProofMode.SLOT_LSN.value)
+        if not isinstance(value, str):
+            raise ValueError("fence_wakeup_mode must be a string")
+        if not isinstance(proof, str):
+            raise ValueError("source_proof_mode must be a string")
+        try:
+            return cls(FenceWakeupMode(value), SourceProofMode(proof))
+        except ValueError as error:
+            raise ValueError(
+                "flip modes must be supported fence wake-up and source-proof values"
+            ) from error
+
 
 def _bounded_integer(name: str, value: int, minimum: int, maximum: int) -> None:
     if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
@@ -19,6 +45,17 @@ class WorkloadSettings:
     active_pause_ms: int = 5
     retiring_pause_ms: int = 10
     payload_bytes: int = 256
+    mode: str = "legacy_batch"
+    active_target_tps: int = 13_636
+    retiring_target_tps: int = 1_364
+    active_rows_per_transaction: int = 1
+    retiring_rows_per_transaction: int = 1
+    active_workers: int = 32
+    retiring_workers: int = 8
+    max_queue_size: int = 30_000
+    rate_window_seconds: int = 5
+    min_achievement_percent: int = 80
+    write_fence_mode: str = WriteFenceMode.WARM_TRACKER_ADVISORY.value
 
     def __post_init__(self) -> None:
         _bounded_integer("active_rows_per_partition", self.active_rows_per_partition, 1, 100_000)
@@ -26,8 +63,73 @@ class WorkloadSettings:
         _bounded_integer("active_pause_ms", self.active_pause_ms, 0, 60_000)
         _bounded_integer("retiring_pause_ms", self.retiring_pause_ms, 0, 60_000)
         _bounded_integer("payload_bytes", self.payload_bytes, 16, 65_536)
+        if self.mode not in ("legacy_batch", "target_rate_v1"):
+            raise ValueError("mode must be legacy_batch or target_rate_v1")
+        try:
+            guard_mode = WriteFenceMode(self.write_fence_mode)
+        except ValueError as error:
+            raise ValueError(
+                "write_fence_mode must be warm_tracker_advisory_v1, "
+                "hot_transactional_v1, or optimistic_detach_v1"
+            ) from error
+        if guard_mode in (
+            WriteFenceMode.HOT_TRANSACTIONAL,
+            WriteFenceMode.OPTIMISTIC_DETACH,
+        ) and self.mode != "target_rate_v1":
+            raise ValueError(
+                f"{guard_mode.value} requires target_rate_v1 workload mode"
+            )
+        _bounded_integer("active_target_tps", self.active_target_tps, 1, 1_000_000)
+        _bounded_integer("retiring_target_tps", self.retiring_target_tps, 1, 1_000_000)
+        self.active_target()
+        self.retiring_target()
+        _bounded_integer("min_achievement_percent", self.min_achievement_percent, 1, 100)
+        if self.mode == "target_rate_v1":
+            if self.total_target_tps > 100_000:
+                raise ValueError("total target TPS must not exceed 100000 on the local profile")
+            if self.active_workers + self.retiring_workers > 64:
+                raise ValueError("total workers must not exceed 64 on the local profile")
+            if self.max_queue_size > 100_000:
+                raise ValueError("queue size must not exceed 100000 per lane on the local profile")
+            in_flight_rows = (
+                self.active_workers * self.active_rows_per_transaction
+                + self.retiring_workers * self.retiring_rows_per_transaction
+            )
+            if in_flight_rows > 250_000:
+                raise ValueError(
+                    "aggregate in-flight rows must not exceed 250000 on the local profile"
+                )
+            in_flight_payload = self.payload_bytes * (
+                in_flight_rows
+            )
+            if in_flight_payload > 256 * 1024 * 1024:
+                raise ValueError(
+                    "aggregate in-flight payload must not exceed 256 MiB on the local profile"
+                )
 
-    def to_dict(self) -> dict[str, int]:
+    @property
+    def total_target_tps(self) -> int:
+        return self.active_target_tps + self.retiring_target_tps
+
+    def active_target(self) -> TrafficTarget:
+        return TrafficTarget(
+            self.active_target_tps,
+            self.active_rows_per_transaction,
+            self.active_workers,
+            self.max_queue_size,
+            self.rate_window_seconds,
+        )
+
+    def retiring_target(self) -> TrafficTarget:
+        return TrafficTarget(
+            self.retiring_target_tps,
+            self.retiring_rows_per_transaction,
+            self.retiring_workers,
+            self.max_queue_size,
+            self.rate_window_seconds,
+        )
+
+    def to_dict(self) -> dict[str, int | str]:
         return asdict(self)
 
 
@@ -97,11 +199,28 @@ def validate_local_batch_budget(
 ) -> None:
     _bounded_integer("table_count", table_count, 1, 1000)
     _bounded_integer("max_batch_bytes", max_batch_bytes, 1, 2**63 - 1)
-    largest_rows = max(settings.active_rows_per_partition, settings.retiring_rows_per_partition)
-    if largest_rows * settings.payload_bytes * table_count > max_batch_bytes:
+    if settings.mode == "target_rate_v1":
+        largest_bytes = max(
+            settings.active_rows_per_transaction,
+            settings.retiring_rows_per_transaction,
+        ) * settings.payload_bytes
+    else:
+        largest_rows = max(settings.active_rows_per_partition, settings.retiring_rows_per_partition)
+        largest_bytes = largest_rows * settings.payload_bytes * table_count
+    if largest_bytes > max_batch_bytes:
         raise ValueError(
             "largest batch exceeds the 16 MiB local safety budget; reduce rows or payload size"
         )
+
+
+def workload_progress_valid(
+    settings: WorkloadSettings,
+    active_rows: int,
+    retiring_rows: int,
+) -> bool:
+    if settings.mode == "target_rate_v1":
+        return active_rows > 0 and retiring_rows > 0
+    return active_rows > retiring_rows > 0
 
 
 class _Counter:
@@ -185,8 +304,8 @@ class LiveWorkload:
     def __init__(self, settings: WorkloadSettings) -> None:
         self._lock = Lock()
         self._settings = settings
-        self._active: LiveBatchWriter | None = None
-        self._retiring: LiveBatchWriter | None = None
+        self._active: LiveBatchWriter | TrafficLane | None = None
+        self._retiring: LiveBatchWriter | TrafficLane | None = None
 
     def settings(self) -> WorkloadSettings:
         with self._lock:
@@ -194,8 +313,16 @@ class LiveWorkload:
 
     def update(self, settings: WorkloadSettings) -> WorkloadSettings:
         with self._lock:
+            previous = self._settings
             self._settings = settings
-            return self._settings
+            active = self._active
+            retiring = self._retiring
+        if settings.mode == "target_rate_v1" and settings != previous:
+            for lane in (active, retiring):
+                reset = getattr(lane, "reset_measurement", None)
+                if callable(reset):
+                    reset()
+        return settings
 
     def start(
         self,
@@ -225,8 +352,41 @@ class LiveWorkload:
         self._active = active
         self._retiring = retiring
 
+    def start_target_rate(
+        self,
+        active_worker_factory: Callable[[], TrafficWorker],
+        retiring_worker_factory: Callable[[], TrafficWorker],
+        table_count: int,
+        operations_per_api_batch: int = 1,
+    ) -> None:
+        if self.running():
+            raise RuntimeError("workload is already running")
+        if self.settings().mode != "target_rate_v1":
+            raise RuntimeError("target-rate start requires target_rate_v1 settings")
+        active = TrafficLane.start(
+            active_worker_factory,
+            lambda: self.settings().active_target(),
+            table_count,
+            operations_per_api_batch,
+        )
+        try:
+            retiring = TrafficLane.start(
+                retiring_worker_factory,
+                lambda: self.settings().retiring_target(),
+                table_count,
+                operations_per_api_batch,
+            )
+        except BaseException:
+            active.stop_and_join(5)
+            raise
+        self._active = active
+        self._retiring = retiring
+
     def running(self) -> bool:
-        return self._active is not None and self._active.is_alive()
+        return any(
+            writer is not None and writer.is_alive()
+            for writer in (self._active, self._retiring)
+        )
 
     def active_is_alive(self) -> bool:
         return self._active is not None and self._active.is_alive()
@@ -240,10 +400,35 @@ class LiveWorkload:
     def retiring_total(self) -> int:
         return 0 if self._retiring is None else self._retiring.total_inserted()
 
+    def traffic_snapshots(self) -> dict[str, TrafficSnapshot] | None:
+        if not isinstance(self._active, TrafficLane) or not isinstance(self._retiring, TrafficLane):
+            return None
+        return {
+            "active": self._active.snapshot(),
+            "retiring": self._retiring.snapshot(),
+        }
+
     def stop_retiring(self, timeout_seconds: float) -> int:
         if self._retiring is None:
             return 0
-        return self._retiring.stop_and_join(timeout_seconds)
+        stopped = self._retiring.stop_and_join(timeout_seconds)
+        return stopped.committed_rows if isinstance(stopped, TrafficSnapshot) else stopped
+
+    def stop_retiring_admission(self, timeout_seconds: float) -> int:
+        if not isinstance(self._retiring, TrafficLane):
+            raise RuntimeError(
+                "optimistic detach requires a target-rate retiring traffic lane"
+            )
+        snapshot = self._retiring.stop_admission(timeout_seconds)
+        return snapshot.committed_rows
+
+    def finish_retiring_in_flight(self, timeout_seconds: float) -> int:
+        if not isinstance(self._retiring, TrafficLane):
+            raise RuntimeError(
+                "optimistic detach requires a target-rate retiring traffic lane"
+            )
+        snapshot = self._retiring.finish_in_flight(timeout_seconds)
+        return snapshot.committed_rows
 
     def stop_all(self, timeout_seconds: float = 5) -> None:
         errors: list[BaseException] = []

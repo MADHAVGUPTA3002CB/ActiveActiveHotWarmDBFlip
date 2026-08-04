@@ -3,10 +3,29 @@ from __future__ import annotations
 import json
 import math
 import re
+import uuid
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Mapping, Sequence
+
+
+class FenceWakeupMode(StrEnum):
+    PASSIVE = "passive"
+    IMMEDIATE_HEARTBEAT = "immediate_heartbeat"
+
+
+class SourceProofMode(StrEnum):
+    SLOT_LSN = "slot_lsn_v1"
+    PER_LEAF_MARKER = "per_leaf_marker_v1"
+    ATOMIC_DETACH_MARKER = "atomic_detach_marker_v1"
+    PARALLEL_ATOMIC_DETACH_MARKER = "parallel_atomic_detach_marker_v1"
+
+
+class WriteFenceMode(StrEnum):
+    WARM_TRACKER_ADVISORY = "warm_tracker_advisory_v1"
+    HOT_TRANSACTIONAL = "hot_transactional_v1"
+    OPTIMISTIC_DETACH = "optimistic_detach_v1"
 
 
 class FlipbenchError(ValueError):
@@ -166,6 +185,35 @@ class BenchmarkManifest:
     tables: tuple[TableRoute, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class LeafFenceMarker:
+    partition: TopicPartition
+    parent: str
+    leaf: str
+    cell: str
+    timeslot: str
+    marker_id: uuid.UUID
+    attempt_id: uuid.UUID
+    attempt_epoch: int
+
+    def __post_init__(self) -> None:
+        if any(
+            _IDENTIFIER_PATTERN.fullmatch(value) is None
+            for value in (self.parent, self.leaf, self.cell, self.timeslot)
+        ):
+            raise ManifestError("leaf fence marker contains an unsafe table identifier")
+        if not isinstance(self.marker_id, uuid.UUID) or not isinstance(
+            self.attempt_id, uuid.UUID
+        ):
+            raise ManifestError("leaf fence marker IDs must be UUIDs")
+        if (
+            not isinstance(self.attempt_epoch, int)
+            or isinstance(self.attempt_epoch, bool)
+            or self.attempt_epoch <= 0
+        ):
+            raise ManifestError("leaf fence marker attempt_epoch must be positive")
+
+
 def build_manifest(table_count: int, cell: str, timeslot: str) -> BenchmarkManifest:
     if table_count not in (5, 10, 15, 20):
         raise ManifestError("table_count must be one of 5, 10, 15, or 20")
@@ -185,6 +233,35 @@ def build_manifest(table_count: int, cell: str, timeslot: str) -> BenchmarkManif
     manifest = BenchmarkManifest(cell, timeslot, prefix, routes)
     validate_manifest(manifest)
     return manifest
+
+
+def build_leaf_fence_markers(
+    manifest: BenchmarkManifest,
+    attempt_id: uuid.UUID,
+    attempt_epoch: int,
+) -> tuple[LeafFenceMarker, ...]:
+    validate_manifest(manifest)
+    if not isinstance(attempt_id, uuid.UUID):
+        raise ManifestError("leaf fence attempt_id must be a UUID")
+    if (
+        not isinstance(attempt_epoch, int)
+        or isinstance(attempt_epoch, bool)
+        or attempt_epoch <= 0
+    ):
+        raise ManifestError("leaf fence attempt_epoch must be positive")
+    return tuple(
+        LeafFenceMarker(
+            partition=TopicPartition(route.topic, route.partition),
+            parent=route.parent,
+            leaf=route.leaf,
+            cell=manifest.cell,
+            timeslot=manifest.timeslot,
+            marker_id=uuid.uuid5(attempt_id, f"flipbench-leaf-fence-v1:{route.leaf}"),
+            attempt_id=attempt_id,
+            attempt_epoch=attempt_epoch,
+        )
+        for route in manifest.tables
+    )
 
 
 def validate_manifest(manifest: BenchmarkManifest) -> None:
@@ -350,6 +427,53 @@ def derive_stage_durations(timestamps_ns: Mapping[str, int]) -> Mapping[str, int
         "writer_park_ns": timestamps_ns["t13"] - timestamps_ns["t2"],
         "whole_attempt_ns": timestamps_ns["t13"] - timestamps_ns["t1"],
     }
+    if "t6w" in timestamps_ns:
+        wakeup_bounds = (
+            timestamps_ns.get("t6"),
+            timestamps_ns["t6w"],
+            timestamps_ns["t7"],
+        )
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in wakeup_bounds
+        ) or not wakeup_bounds[0] <= wakeup_bounds[1] <= wakeup_bounds[2]:
+            raise TimingError("fence wake-up timestamps must satisfy t6 <= t6w <= t7")
+        result["fence_wakeup_ns"] = wakeup_bounds[1] - wakeup_bounds[0]
+        result["slot_wait_after_wakeup_ns"] = wakeup_bounds[2] - wakeup_bounds[1]
+    if "t2h" in timestamps_ns:
+        hot_fence_closed = timestamps_ns["t2h"]
+        if (
+            not isinstance(hot_fence_closed, int)
+            or isinstance(hot_fence_closed, bool)
+            or not timestamps_ns["t2"] <= hot_fence_closed <= timestamps_ns["t13"]
+        ):
+            raise TimingError("hot fence timestamp must satisfy t2 <= t2h <= t13")
+        result["hot_fence_park_ns"] = hot_fence_closed - timestamps_ns["t2"]
+        tracker_locked = timestamps_ns.get("t2w")
+        if (
+            not isinstance(tracker_locked, int)
+            or isinstance(tracker_locked, bool)
+            or not hot_fence_closed <= tracker_locked <= timestamps_ns["t13"]
+        ):
+            raise TimingError("hot fence tracker timestamp must satisfy t2h <= t2w <= t13")
+        result["tracker_lock_ns"] = tracker_locked - hot_fence_closed
+        result["admission_to_park_ns"] = timestamps_ns["t2"] - timestamps_ns["t1"]
+        admission_stopped = timestamps_ns.get("t2f")
+        if admission_stopped is not None:
+            in_flight_resolved = timestamps_ns.get("t2q")
+            if (
+                not isinstance(admission_stopped, int)
+                or isinstance(admission_stopped, bool)
+                or not tracker_locked <= admission_stopped <= timestamps_ns["t5"]
+                or not isinstance(in_flight_resolved, int)
+                or isinstance(in_flight_resolved, bool)
+                or not admission_stopped <= in_flight_resolved <= timestamps_ns["t5"]
+            ):
+                raise TimingError(
+                    "optimistic detach timestamps must satisfy t2w <= t2f <= t2q <= t5"
+                )
+            result["admission_fence_ns"] = admission_stopped - tracker_locked
+            result["in_flight_resolution_ns"] = in_flight_resolved - admission_stopped
     if "tverify" in timestamps_ns:
         verify = timestamps_ns["tverify"]
         if not isinstance(verify, int) or isinstance(verify, bool) or verify < timestamps_ns["t13"]:

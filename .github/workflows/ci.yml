@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python safety suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install package and coverage
+        run: python -m pip install --upgrade pip coverage && python -m pip install -e .
+
+      - name: Run unit and contract tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Enforce deterministic safety coverage
+        run: |
+          PYTHONPATH=src python -m coverage run --branch \
+            --source=flipbench.core,flipbench.settings,flipbench.connector_configs,flipbench.results,flipbench.playground,flipbench.traffic,flipbench.matrix,flipbench.benchmark_plan,flipbench.playground_results,flipbench.playground_supervisor \
+            -m unittest discover -s tests -p 'test_*.py'
+          python -m coverage report --fail-under=80
+
+  ui:
+    name: Playground UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: playground-ui
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.13.0"
+          cache: npm
+          cache-dependency-path: playground-ui/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and test rendered UI
+        run: npm test
+
+      - name: Lint UI
+        run: npm run lint

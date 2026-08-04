@@ -6,6 +6,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from flipbench.connector_configs import (
+    FENCE_HEADER_NAME,
+    FENCE_HEADER_VALUE,
+    fence_source_spec,
+    source_specs,
     shared_sink_config,
     source_config,
     topic_names,
@@ -97,8 +101,104 @@ class ConnectorConfigTests(unittest.TestCase):
         self.assertEqual(len(topics), 12)
         self.assertEqual(len(set(topics)), len(topics))
 
+    def test_isolated_topology_uses_disjoint_active_and_migration_sources(self) -> None:
+        configured = settings()
+        object.__setattr__(configured, "source_topology", "isolated")
+        manifest = build_manifest(5, "cell01", "retiring")
+        specs = source_specs(configured, manifest)
+
+        self.assertEqual([spec.lane for spec in specs], ["active", "migration"])
+        self.assertEqual(len({spec.connector_name for spec in specs}), 2)
+        self.assertEqual(len({spec.slot_name for spec in specs}), 2)
+        self.assertEqual(len({spec.publication_name for spec in specs}), 2)
+        self.assertEqual(len({spec.topic_prefix for spec in specs}), 2)
+        active, migration = specs
+        self.assertIn(r"public\.bench_table_01_p_active", active.config["table.include.list"])
+        self.assertNotIn(r"public\.bench_table_01_p_retiring", active.config["table.include.list"])
+        self.assertIn(r"public\.bench_table_01_p_retiring", migration.config["table.include.list"])
+        self.assertNotIn(r"public\.bench_table_01_p_active", migration.config["table.include.list"])
+        self.assertEqual(fence_source_spec(configured, manifest), migration)
+        self.assertEqual(migration.config["transforms.route.replacement"], "cards.cell01.public.$1")
+
+    def test_migration_source_routes_allowlisted_leaf_markers_with_a_control_header(self) -> None:
+        configured = settings()
+        object.__setattr__(configured, "source_topology", "isolated")
+        manifest = build_manifest(5, "cell01", "retiring")
+        active, migration = source_specs(configured, manifest)
+
+        self.assertNotIn(r"flipbench_fence\.bench_table_01_p_retiring", active.config["table.include.list"])
+        self.assertIn(r"flipbench_fence\.bench_table_01_p_retiring", migration.config["table.include.list"])
+        self.assertEqual(migration.config["exactly.once.support"], "required")
+        self.assertEqual(migration.config["transaction.boundary"], "poll")
+        self.assertEqual(migration.config["transforms"], "markFence,routeFence,route")
+        self.assertEqual(
+            migration.config["transforms.markFence.type"],
+            "org.apache.kafka.connect.transforms.InsertHeader",
+        )
+        self.assertEqual(migration.config["transforms.markFence.header"], FENCE_HEADER_NAME)
+        self.assertEqual(migration.config["transforms.markFence.value.literal"], FENCE_HEADER_VALUE)
+        self.assertEqual(migration.config["transforms.markFence.predicate"], "isFenceTopic")
+        self.assertEqual(
+            migration.config["predicates.isFenceTopic.type"],
+            "org.apache.kafka.connect.transforms.predicates.TopicNameMatches",
+        )
+        self.assertNotIn(".*", migration.config["predicates.isFenceTopic.pattern"])
+        self.assertEqual(
+            migration.config["transforms.routeFence.replacement"],
+            "cards.cell01.migration.public.$1",
+        )
+
+    def test_sink_routes_markers_to_control_receipts_before_business_routing(self) -> None:
+        manifest = build_manifest(5, "cell01", "retiring")
+        config = shared_sink_config(settings(), manifest)
+
+        self.assertEqual(config["consumer.override.isolation.level"], "read_committed")
+        self.assertEqual(config["transforms"], "routeFence,route")
+        self.assertEqual(
+            config["predicates.isFenceRecord.type"],
+            "org.apache.kafka.connect.transforms.predicates.HasHeaderKey",
+        )
+        self.assertEqual(config["predicates.isFenceRecord.name"], FENCE_HEADER_NAME)
+        self.assertEqual(config["transforms.routeFence.predicate"], "isFenceRecord")
+        self.assertEqual(
+            config["transforms.routeFence.replacement"],
+            "public.flipbench_fence_receipts",
+        )
+
+    def test_isolated_topology_keeps_canonical_leaf_topics_and_unique_heartbeats(self) -> None:
+        configured = settings()
+        object.__setattr__(configured, "source_topology", "isolated")
+        manifest = build_manifest(5, "cell01", "retiring")
+        topics = topic_names(manifest, configured)
+
+        self.assertIn("cards.cell01.public.bench_table_01_p_active", topics)
+        self.assertIn("cards.cell01.public.bench_table_01_p_retiring", topics)
+        self.assertIn("__debezium-heartbeat.cards.cell01.active", topics)
+        self.assertIn("__debezium-heartbeat.cards.cell01.migration", topics)
+        self.assertEqual(len(topics), len(set(topics)))
+
 
 class SettingsTests(unittest.TestCase):
+    def test_reads_and_validates_source_topology(self) -> None:
+        environment = {
+            "HOT_DSN": "postgresql://hot/cards",
+            "WARM_DSN": "postgresql://warm/cards",
+            "KAFKA_BOOTSTRAP": "kafka:19092",
+            "SOURCE_CONNECT_URL": "http://source:8083",
+            "SINK_CONNECT_URL": "http://sink:8083",
+            "POSTGRES_PASSWORD": "test-only",
+            "SOURCE_TOPOLOGY": "isolated",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            configured = Settings.from_env(5)
+        self.assertEqual(configured.source_topology, "isolated")
+
+        environment["SOURCE_TOPOLOGY"] = "per-table"
+        with patch.dict(os.environ, environment, clear=True), self.assertRaisesRegex(
+            ManifestError, "SOURCE_TOPOLOGY"
+        ):
+            Settings.from_env(5)
+
     def test_connector_passwords_are_distinct_from_admin_and_each_other(self) -> None:
         configured = settings()
         self.assertNotEqual(configured.source_database_password, configured.postgres_password)

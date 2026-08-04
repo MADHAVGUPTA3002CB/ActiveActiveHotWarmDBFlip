@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .connect_api import ConnectClient
+from .connector_configs import fence_source_spec, source_specs
 from .core import (
     BenchmarkManifest,
     TimingError,
@@ -61,6 +62,13 @@ class ProductionWorkload:
         return self.writers.stop_active(timeout_seconds)
 
 
+def _wait_sources_running(
+    source: ConnectClient, settings: Settings, manifest: BenchmarkManifest
+) -> None:
+    for spec in source_specs(settings, manifest):
+        source.wait_state(spec.connector_name, "RUNNING")
+
+
 def prepare_paused_backlog(
     settings: Settings,
     manifest: BenchmarkManifest,
@@ -71,7 +79,8 @@ def prepare_paused_backlog(
     run_id = uuid.uuid4()
     source = ConnectClient(settings.source_connect_url)
     sink = ConnectClient(settings.sink_connect_url)
-    source.wait_state(settings.source_connector, "RUNNING")
+    fence_source = fence_source_spec(settings, manifest)
+    _wait_sources_running(source, settings, manifest)
     sink_connector = manifest.tables[0].sink_connector
     sink.set_paused(sink_connector, True)
     sink.wait_state(sink_connector, "PAUSED")
@@ -86,11 +95,11 @@ def prepare_paused_backlog(
         payload_bytes,
     )
     with connect(settings.hot_dsn, autocommit=True) as hot:
-        _, fence = hot_identity(hot, settings.cell, settings.slot_name)
-        wait_slot_lsn(hot, settings.cell, settings.slot_name, fence, 120, 0.1)
+        _, fence = hot_identity(hot, settings.cell, fence_source.slot_name)
+        wait_slot_lsn(hot, settings.cell, fence_source.slot_name, fence, 120, 0.1)
 
-    source.set_paused(settings.source_connector, True)
-    source.wait_state(settings.source_connector, "PAUSED")
+    source.set_paused(fence_source.connector_name, True)
+    source.wait_state(fence_source.connector_name, "PAUSED")
     source_events = guarded_insert_events(
         settings.hot_dsn,
         settings.warm_dsn,
@@ -101,7 +110,7 @@ def prepare_paused_backlog(
         payload_bytes,
     )
     with connect(settings.hot_dsn, autocommit=True) as hot:
-        lag_bytes = slot_status(hot, settings.cell, settings.slot_name).lag_bytes
+        lag_bytes = slot_status(hot, settings.cell, fence_source.slot_name).lag_bytes
     if lag_bytes <= 0:
         raise RuntimeError("failed to establish non-zero source lag")
     return PreparedLag(run_id, sink_events, source_events, lag_bytes)
@@ -133,7 +142,8 @@ def prepare_running_overload(
 
     source = ConnectClient(settings.source_connect_url)
     sink = ConnectClient(settings.sink_connect_url)
-    source.wait_state(settings.source_connector, "RUNNING")
+    fence_source = fence_source_spec(settings, manifest)
+    _wait_sources_running(source, settings, manifest)
     sink.wait_state(manifest.tables[0].sink_connector, "RUNNING")
 
     partitions = tuple(TopicPartition(route.topic, route.partition) for route in manifest.tables)
@@ -144,7 +154,7 @@ def prepare_running_overload(
     baseline_end_raw = kafka.end_offsets(partitions)
     baseline_end = {partition.key: baseline_end_raw[partition] for partition in partitions}
     with connect(settings.hot_dsn, autocommit=True) as hot:
-        baseline_slot = slot_status(hot, settings.cell, settings.slot_name)
+        baseline_slot = slot_status(hot, settings.cell, fence_source.slot_name)
 
     run_id = uuid.uuid4()
     writer = BackgroundBatchWriter.start(
@@ -171,7 +181,9 @@ def prepare_running_overload(
         with connect(settings.hot_dsn, autocommit=True) as hot:
             while time.monotonic() < deadline:
                 inserted = writer.total_inserted()
-                last_source_lag = slot_status(hot, settings.cell, settings.slot_name).lag_bytes
+                last_source_lag = slot_status(
+                    hot, settings.cell, fence_source.slot_name
+                ).lag_bytes
                 sample_started_ns = time.perf_counter_ns()
                 end_offsets_raw = kafka.end_offsets(partitions)
                 remaining = max(0.1, deadline - time.monotonic())
@@ -306,7 +318,8 @@ def prepare_production_workload(
 
     source = ConnectClient(settings.source_connect_url)
     sink = ConnectClient(settings.sink_connect_url)
-    source.wait_state(settings.source_connector, "RUNNING")
+    fence_source = fence_source_spec(settings, manifest)
+    _wait_sources_running(source, settings, manifest)
     sink.wait_state(manifest.tables[0].sink_connector, "RUNNING")
 
     run_id = uuid.uuid4()
@@ -350,7 +363,9 @@ def prepare_production_workload(
                     group_by_partition,
                     min(2.0, max(0.1, deadline - time.monotonic())),
                 )
-                last_lag_bytes = slot_status(hot, settings.cell, settings.slot_name).lag_bytes
+                last_lag_bytes = slot_status(
+                    hot, settings.cell, fence_source.slot_name
+                ).lag_bytes
                 last_sink_lag = {
                     partition.key: max(0, end_offsets[partition] - committed.get(partition, 0))
                     for partition in partitions

@@ -1,157 +1,254 @@
-# Flipbench: hot-to-warm ownership prototype
+# Flipbench
 
-Flipbench measures and verifies this non-barrier ownership path:
+Flipbench is a local correctness and performance prototype for transferring a retiring PostgreSQL partition from a hot database to a warm database through Debezium and Kafka.
 
-```text
-hot PostgreSQL -> Debezium PostgreSQL source -> one Kafka topic per leaf
-               -> one shared Debezium JDBC sink -> warm PostgreSQL
-               -> LSN proof + component-wise offset proof -> warm_primary
+It runs real PostgreSQL, Kafka, Debezium source connectors, a Debezium JDBC sink, traffic generators, a flip coordinator, and a browser playground. It does not simulate the measured flip timings.
+
+> [!WARNING]
+> This is a research prototype, not a production deployment. Kafka and Connect are unauthenticated, the control APIs trust the local machine, and all exposed ports bind to loopback. Do not expose this stack to a network without adding authentication, authorization, TLS, secret management, and production operations controls.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    UI["Playground UI :3000"] --> API["Control API :8090"]
+    UI --> SUP["Restart supervisor :8091"]
+    SUP --> API
+    API --> HOT["Hot PostgreSQL :55432"]
+    HOT --> SRC["Debezium source Connect :8083"]
+    SRC --> KAFKA["Kafka leaf topics"]
+    KAFKA --> SINK["Debezium JDBC sink Connect :8084"]
+    SINK --> WARM["Warm PostgreSQL :55433"]
+    API --> WARM
+    API --> KAFKA
+    API --> RESULTS["Ignored local results/"]
 ```
 
-The selected design is `publish_via_partition_root=false`. Current and next-timeslot leaves have separate topics, and every leaf topic has exactly one Kafka partition. Active traffic continues while only the retiring timeslot is quiesced and transferred.
+The selected CDC layout uses `publish_via_partition_root=false`: every PostgreSQL leaf has its own Kafka topic and every leaf topic has exactly one Kafka partition. Active traffic continues while only the retiring timeslot is fenced, detached, drained, and granted to warm ownership.
 
-## Implemented production-parity controls
+The prototype supports 5, 10, 15, or 20 partitioned tables and variants A through H. See [Architecture](docs/architecture.md) and [Variant reference](docs/variants.md) for the detailed flow and correctness contracts.
 
-- 5, 10, 15, or 20 partitioned tables generated from one immutable manifest.
-- One publication, logical slot and source connector per cell.
-- One anchored-regex JDBC sink connector for all allowlisted active and retiring leaf topics. `RegexRouter` maps both timeslots to the correct warm parent table.
-- Exact manifest alternation prevents a five-table sink from subscribing to table 06–99 topics. Source and sink use separate least-privilege, non-superuser database roles.
-- A timeslot-scoped lifecycle lock, guarded ownership CAS, and independent active-heavy/retiring-light writers.
-- Serial `DETACH PARTITION CONCURRENTLY`, exact hot system identity and fence LSN, durable per-topic target vector `E`, and component-wise committed-next-offset checks.
-- Four ownership proofs before grant: catalog detached, source fence reached, target vector frozen, and every sink offset reached its target.
-- `warm_primary` ends the ownership transfer. Full row-count/checksum reconciliation runs afterward and separately controls garbage-collection eligibility.
-- Automatic fail-closed recovery: pending detaches are finalized, detached leaves are reattached, the catalog is verified, and ownership returns to `hot_primary`. A failed recovery remains `recovering`.
-- Configurable Connect offset interval/timeout, distributed-worker rebalance/session/heartbeat settings, JDBC batching/pool size, Kafka replication factor and `min.insync.replicas`.
-- Optional three-broker local Kafka profile with data/internal-topic RF=3 and `min.insync.replicas=2`.
-- Machine-readable topology, workload snapshots, stage timings, recovery outcome, verification outcome and effective tuning in `results/<run-id>/run.json`.
+## Prerequisites
 
-## Local profiles and limits
+- Docker Desktop or Docker Engine with Docker Compose v2
+- GNU Make
+- Python 3.13 for host-side tests and the restart supervisor
+- Node.js 22.13 or newer and npm for the playground UI
+- At least 12 GiB of free Docker disk space for the three-broker profile; more is recommended for long/high-load runs
 
-`make up` uses one Kafka broker (RF=1). Use it for fast correctness and relative tuning only.
+The current local profile was developed on macOS, but its runtime services are Docker containers. Linux users only need the same commands and prerequisites.
 
-`make up-rf3` runs three Kafka broker/controller containers on the same laptop. It verifies Kafka durability configuration and protocol overhead, but it is not equivalent to three failure-independent hosts. The default local ceilings are 512 MB per Kafka JVM and 768 MB per Connect JVM because the Docker VM exposes about 6.2 GB. Every result records these values.
+## Quick start: production-shaped local profile
 
-The prototype intentionally skips separate physical nodes, production hardware matching, network emulation, TLS and SASL. Exact production schema parity and traffic replay remain blocked until the real DDL/index/constraint set and a sanitized traffic distribution are supplied.
-
-This remains a non-adversarial local benchmark. Connect REST and Kafka PLAINTEXT listeners have no authentication, and the lifecycle runner intentionally retains an administrative PostgreSQL role. Those controls must change before deployment.
-
-## Run
+Clone the repository, then run all commands from its root:
 
 ```bash
-cd /Users/madhav.gupta/Documents/DB_PROJECT/prototype
-install -m 600 .env.example .env
-# Replace POSTGRES_PASSWORD in .env.
+cp .env.example .env
+chmod 600 .env
+```
+
+Edit `.env` and replace `POSTGRES_PASSWORD=replace-with-local-only-password` with a local-only password. Do not commit `.env`.
+
+Install the UI packages and validate the local tools:
+
+```bash
+cd playground-ui
+npm ci
+cd ..
+
 make preflight
 make test
-
-# Fast RF=1 path
-make up
-make setup TABLE_COUNT=5
-make benchmark-prodlike TABLE_COUNT=5
-
-# Production-shaped local Kafka durability
-make reset
-make up-rf3
-make setup-rf3 TABLE_COUNT=5
-make benchmark-prodlike-rf3 TABLE_COUNT=5
+make config-rf3
 ```
 
-The production-shaped defaults enforce a 200 ms writer-park budget and reserve 50 ms for safe revert. On this laptop that budget usually exercises the revert path. A wider diagnostic budget can characterize the complete forward path:
-
-The source, sink and PostgreSQL administrator credentials are always distinct. Blank `CDC_PASSWORD` and `SINK_PASSWORD` values derive role-specific one-way credentials in memory for this local prototype; explicit distinct values may be supplied instead.
+Create the three-broker stack and initialize five tables with isolated active/migration CDC lanes:
 
 ```bash
-make benchmark-prodlike-rf3 \
-  TABLE_COUNT=5 \
-  PRODLIKE_ACTIVE_BATCH_PER_TABLE=20 \
-  PRODLIKE_PARK_BUDGET_MS=1500 \
-  PRODLIKE_REVERT_RESERVE_MS=100
+make up-rf3 SOURCE_TOPOLOGY=isolated
+make setup-rf3 TABLE_COUNT=5 SOURCE_TOPOLOGY=isolated
 ```
 
-Successful flips intentionally leave retiring leaves detached. Reset volumes before another independent ownership run:
+Start the control API, restart supervisor, and UI together:
+
+```bash
+make playground-rf3 TABLE_COUNT=5 SOURCE_TOPOLOGY=isolated
+```
+
+Open [http://localhost:3000](http://localhost:3000). Keep that terminal running while using the playground. Press `Ctrl+C` to stop the UI and supervisor; the Docker data services remain running.
+
+### Playground workflow
+
+1. Choose workload targets, row counts, worker counts, admission thresholds, and a flip variant.
+2. Start traffic and wait until the source/sink lag and achieved-throughput admission checks are stable.
+3. Press **Start flip**.
+4. Inspect the stage breakdown and the saved result after ownership reaches `warm_primary` or the run safely reverts.
+5. Use **New experiment** for a clean RF3 generation. It requires typing `RESET` and preserves host-side result files.
+
+The UI controls real local services. A requested TPS value is a target; achieved TPS depends on the host and may be lower.
+
+## Faster one-broker profile
+
+Use this for correctness development and faster iterations, not durability comparisons:
+
+```bash
+make up SOURCE_TOPOLOGY=shared
+make setup TABLE_COUNT=5 SOURCE_TOPOLOGY=shared
+make playground TABLE_COUNT=5 SOURCE_TOPOLOGY=shared
+```
+
+The one-broker profile uses replication factor 1. The RF3 profile runs three brokers on one physical machine, so it exercises replication protocol/configuration but does not provide host-failure independence.
+
+## Important configuration
+
+`TABLE_COUNT` may be `5`, `10`, `15`, or `20`. `SOURCE_TOPOLOGY` may be:
+
+- `shared`: one source publication, logical slot, and connector for active and retiring leaves;
+- `isolated`: separate active and migration publications, slots, and connectors.
+
+Changing either value requires a reset and setup because it changes real database, topic, and connector topology:
 
 ```bash
 make reset-rf3
+make up-rf3 SOURCE_TOPOLOGY=isolated
+make setup-rf3 TABLE_COUNT=10 SOURCE_TOPOLOGY=isolated
 ```
 
-## Interactive playground
+`reset` and `reset-rf3` delete the corresponding local Docker volumes. They do not delete the host-mounted `results/` directory.
 
-The playground controls the real local writers and reads live PostgreSQL slot and Kafka consumer-offset metrics. It does not generate simulated latency numbers.
+## Flip variants
 
-For a fresh RF3 experiment:
-
-```bash
-make reset-rf3
-make up-rf3
-make setup-rf3 TABLE_COUNT=5
-make playground-api-rf3
-make playground-supervisor   # separate terminal
-make playground-ui           # separate terminal
-```
-
-Open [http://localhost:3000](http://localhost:3000). From the UI you can start or stop active/retiring traffic, change both batch sizes and pauses while traffic is running, edit admission thresholds, start the guarded flip, and inspect the t1→t13 timing breakdown.
-
-Live batch changes reset the stable admission window, and both workload and threshold settings freeze once a flip starts. The API limits the largest cross-table transaction payload to 16 MiB so an accidental UI value cannot request an unbounded local batch.
-
-After the first setup, `make playground-rf3` starts the API, restart supervisor and UI together. The UI's **New experiment** control performs the same scoped RF3 reset/setup sequence. It atomically puts the API into maintenance mode before checking ownership, refuses to reset during a running flip, preserves the host-mounted `results/` directory, and requires typing `RESET` exactly. The supervisor retries a transient control-API disconnect before failing closed, preserves precise safety rejections such as a running flip, and reports a recovery hint without deleting volumes. If it reports `control_api_unavailable`, restore the current API with `make playground-api-rf3 TABLE_COUNT=<current table count>`, wait for `http://localhost:8090/api/health`, and retry from the UI.
-
-When `warm_primary` is granted, the runner atomically saves `results/<run-id>/ownership-grant.json` before post-grant verification. This file is historical evidence only; PostgreSQL remains the live ownership authority. The later `run.json` replaces the pending checkpoint in the UI's saved-run history once verification finishes.
-
-`TABLE_COUNT` supports 5, 10, 15, or 20 and is fixed when the local environment is set up. Each table currently has exactly two database leaves—active and retiring—and every leaf topic has one Kafka partition. Those topology fields are read-only in the live UI because changing them requires real DDL, publication, topic, and connector reconfiguration; the UI does not pretend an unsupported topology was tested.
-
-The control API and restart supervisor are published only on host loopback at `127.0.0.1:8090` and `127.0.0.1:8091`. They accept browser mutations only from `http://localhost:3000`, cap JSON request bodies, and use fixed reset commands and the existing guarded insert/flip paths. They assume a trusted single-user laptop: Origin/Host checks protect the browser workflow, but the loopback service is not an authorization boundary against another local process. This is a local benchmark control plane, not a production service.
-
-`down` does not erase data. Topic deletion is deliberately outside the flip and must wait until the replay/recovery retention policy permits garbage collection.
-
-## Production-shaped admission
-
-Two independent writers model the selected workload:
-
-- active timeslot: heavy, continuous writes;
-- retiring timeslot: light writes that are stopped at `t2q`;
-- source and sink connectors remain `RUNNING`;
-- admission requires bounded source-slot WAL lag, bounded retiring sink lag, all tasks running, and a stable sample window;
-- active insert counts are captured at `t1`, `t2q`, and `t13` to prove active traffic continued through the retiring flip.
-
-The lag thresholds are configuration, not a hardcoded sleep or manufactured backlog. A preparation failure occurs before ownership locks and leaves the tracker at `hot_primary`.
-
-## Timing fields
-
-| Field | Meaning |
+| Variant | Main experiment |
 |---|---|
-| `t0` | Preflight starts |
-| `t1` | Connector and lag admission passes |
-| `t2` | Durable retiring-timeslot ownership lock is created |
-| `t2q` | Lifecycle locks acquired and retiring writer joined; active writer remains live |
-| `t3_i`, `t4_i` | Per-table detach start/end |
-| `t5`, `t6` | Exact hot fence LSN captured and persisted on warm |
-| `t7` | Slot `confirmed_flush_lsn` reaches the fence |
-| `t8`, `t9` | Kafka target next-offset vector `E` captured and persisted |
-| `t10`, `t11` | Tested sink commit contract and component-wise `C >= E` hold |
-| `t12` | Durable `drained` CAS completes |
-| `t13` | Durable `warm_primary` CAS completes; writer park ends |
-| `tverify` | Post-grant hot/warm reconciliation completes; separately sets GC eligibility |
-| `trevert_start`, `trevert_end` | Safe reattach/revert interval after a forward-path failure |
+| A | Shared CDC source; LSN and Kafka consumer-offset proof |
+| B | Isolated active/migration CDC sources; passive source heartbeat |
+| B+ | B plus an immediate migration-lane heartbeat after the fence |
+| D | B+ plus a hot-local gate lock and epoch check in every table operation |
+| E | One optimistic ownership admission per API-style batch; separate table-operation commits |
+| F | E foreground path plus exact per-leaf Kafka markers and warm receipts |
+| G | Serial per-leaf transactions that atomically detach and insert the marker |
+| H | Parallel per-leaf atomic detach-marker transactions with all-or-recover semantics |
 
-`writer_park_ns` is `t13 - t2`. `validation_ns` is post-grant verification. `whole_lifecycle_ns` includes both. All use one process-local monotonic clock.
+Variants A–E prove source and sink progress with LSN/offset evidence. F–H use exact marker observation in each retiring leaf topic and exact receipt rows in warm PostgreSQL. All paths remain fail-closed: missing evidence prevents `warm_primary`, and recovery must catalog-verify every reattached leaf before reopening hot ownership.
 
-For reverted results, `writer_park_ns` is `trevert_end - t2`, `forward_until_failure_ns` isolates the forward attempt, and `revert_ns` measures the reserved recovery interval.
+## Reusable benchmark plans
 
-## Hard correctness limits
+Benchmark plans under `config/benchmark-plans/` define variants, TPS levels, repetitions, table count, warmup, measurement duration, thresholds, and safety policy without code changes.
 
-- A missing target offset is corruption; a missing committed offset is pending.
-- Kafka offsets are next offsets and are never summed to prove completion.
-- Sink errors stop the connector (`errors.tolerance=none`); skipped records invalidate the proof.
-- `created_at` and `id` key movement is rejected.
-- The source proof fails if cell, PostgreSQL system identifier, database or slot identity differs.
-- Recovery claims `hot_primary` only after every leaf is catalog-verified as attached and all exact-attempt CAS operations succeed.
-- Offset proof grants ownership; checksum verification grants cleanup eligibility. Failed verification does not silently delete data.
+Validate a plan without resetting anything:
 
-Measured evidence and interpretation are in [the measured-results report](../docs/research/flip-prototype-measured-results-2026-08-01.md).
+```bash
+make benchmark-plan-dry-run
+```
 
-## Verification status
+With the RF3 control API and supervisor running, execute the default plan:
 
-- 84 tests are discovered locally; environment-dependent Kafka/live-stack tests run inside the runner image.
-- Five RF3 live integration contracts pass.
-- The deterministic safety layer (`core`, settings, routing and result validation) has 82% branch-aware coverage.
-- Full-package branch coverage is currently 38% because the database/Connect/Kafka orchestration and crash-recovery paths are exercised live but not yet driven under coverage. This does **not** meet the project-wide 80% production gate; automated partial-detach/crash injection remains required before production qualification.
+```bash
+make benchmark-plan CONFIRM_RESET=RESET
+```
+
+Or select another plan:
+
+```bash
+make benchmark-plan \
+  BENCHMARK_PLAN=config/benchmark-plans/d-e-quick.json \
+  CONFIRM_RESET=RESET
+```
+
+Each case receives a fresh environment generation. Output is written to ignored directories under `results/` and includes the matrix, a Markdown report, validated raw run data, and content hashes. Copy only deliberately selected, sanitized evidence into version control.
+
+## Tests and checks
+
+```bash
+# Python unit and contract tests that do not require a live stack
+make test
+
+# Deterministic safety modules; requires a local .venv with coverage installed
+make safety-coverage
+
+# Compose validation
+make config
+make config-rf3
+
+# UI build, rendered-page tests, and lint
+cd playground-ui
+npm test
+npm run lint
+cd ..
+
+# Live PostgreSQL/Kafka/Debezium contracts; requires initialized RF3 services
+make live-contracts-rf3 TABLE_COUNT=5 SOURCE_TOPOLOGY=isolated
+```
+
+GitHub Actions runs the host-side Python safety suite plus the UI build/test/lint checks. The live RF3 suite remains a deliberate local integration test because it is resource intensive.
+
+## Service ports
+
+| Service | Local address |
+|---|---|
+| Playground UI | `http://localhost:3000` |
+| Control API | `http://127.0.0.1:8090` |
+| Restart supervisor | `http://127.0.0.1:8091` |
+| Hot PostgreSQL | `127.0.0.1:55432` |
+| Warm PostgreSQL | `127.0.0.1:55433` |
+| Source Connect REST | `http://127.0.0.1:8083` |
+| Sink Connect REST | `http://127.0.0.1:8084` |
+| Kafka broker 1 | `127.0.0.1:29092` |
+| Kafka broker 2 (RF3) | `127.0.0.1:29093` |
+| Kafka broker 3 (RF3) | `127.0.0.1:29094` |
+
+## Repository layout
+
+```text
+config/benchmark-plans/  Reusable benchmark matrices and safety limits
+docker/                  PostgreSQL bootstrap SQL and runner image
+docs/                    Architecture and variant documentation
+playground-ui/           React/Vinext browser control room
+schemas/                 Versioned JSON schema for result artifacts
+src/flipbench/            Python control plane, workload, flip and recovery logic
+tests/                    Unit, contract and live integration tests
+tools/                    Host-side benchmark-plan and reporting commands
+compose.yaml              Base one-broker stack
+compose.rf3.yaml          Three-broker production-shaped overlay
+Makefile                  Supported developer and operator commands
+```
+
+Local credentials, Python/Node caches, UI build output, and raw benchmark results are excluded through `.gitignore`.
+
+## Shutdown and troubleshooting
+
+Stop containers without deleting their data:
+
+```bash
+# One-broker profile
+make down
+
+# Three-broker profile
+make down-rf3
+```
+
+View core service logs:
+
+```bash
+make logs
+make logs-rf3  # three-broker profile
+```
+
+If the UI says the control API is unavailable, restore it with the same table count and topology used during setup:
+
+```bash
+make playground-api-rf3 TABLE_COUNT=5 SOURCE_TOPOLOGY=isolated
+```
+
+Then start the host supervisor if the UI restart/history controls are unavailable:
+
+```bash
+make playground-supervisor
+```
+
+Docker disk use grows during sustained Kafka load. Monitor Docker Desktop storage and reset old local volumes between independent experiments when their data is no longer needed.
+
+## Production-readiness boundary
+
+This repository validates algorithms and measures one-machine behavior. It does not yet validate production hardware, multi-host network behavior, TLS/SASL cost, real schema/index parity, a sanitized production traffic distribution, automated chaos coverage for every partial failure, or a complete production observability/on-call runbook.
+
+See [SECURITY.md](SECURITY.md) before sharing or running the project outside a trusted local development machine.
