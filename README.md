@@ -26,7 +26,7 @@ flowchart LR
 
 The selected CDC layout uses `publish_via_partition_root=false`: every PostgreSQL leaf has its own Kafka topic and every leaf topic has exactly one Kafka partition. Active traffic continues while only the retiring timeslot is fenced, detached, drained, and granted to warm ownership.
 
-The prototype supports 5, 10, 15, or 20 partitioned tables and variants A through H. See [Architecture](docs/architecture.md), [Load generator](docs/load-generator.md), and [Variant reference](docs/variants.md) for the detailed flow, workload model, and correctness contracts.
+The prototype supports 5, 10, 15, or 20 partitioned tables and variants A through H. See [Architecture](docs/architecture.md), [Load generator](docs/load-generator.md), [Variant reference](docs/variants.md), [final Variant H production guide](docs/variant-h-production-single-debezium.md), and [Variant H feasibility research](docs/variant-h-production-feasibility.md) for the detailed flow, workload model, correctness contracts, selected single-source production design, and supporting research.
 
 ## Prerequisites
 

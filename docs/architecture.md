@@ -160,3 +160,5 @@ The UI saves an ownership-grant checkpoint as soon as `warm_primary` is reached,
 - Production rollout, monitoring, alerting, capacity limits and on-call recovery procedures still need definition.
 
 These gaps mean local results are useful for comparing variants and identifying bottlenecks, but they are not direct production latency promises.
+
+See the [final Variant H production guide](variant-h-production-single-debezium.md) for the selected one-source-connector control plane and complete implementation flow. The [Variant H feasibility research](variant-h-production-feasibility.md) preserves the earlier shared-versus-isolated analysis.

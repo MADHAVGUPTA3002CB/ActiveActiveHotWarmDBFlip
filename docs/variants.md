@@ -63,6 +63,8 @@ H runs G's exact per-leaf transaction concurrently, using one PostgreSQL connect
 
 All workers must finish successfully before marker observation begins. If any worker fails, ownership is not granted and catalog-driven recovery reattaches every leaf that committed successfully. Parallelism improves latency at the cost of a short burst of database connections and lock work.
 
+The prototype currently requires isolated active/migration sources when H is selected. H's exact-marker correctness proof does not fundamentally require that split. The [final Variant H production guide](variant-h-production-single-debezium.md) defines the selected one-source-connector implementation, rolling partition lifecycle, recovery, cleanup, and validation required for a real system. The [feasibility research](variant-h-production-feasibility.md) keeps the earlier topology comparison.
+
 ## How to choose a variant for a test
 
 - Use A as the shared-source baseline.
