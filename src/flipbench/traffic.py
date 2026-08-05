@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
-from typing import Callable, Protocol
+from typing import Callable, Literal, Protocol
 
 from .connect_api import redact_error_detail
 
@@ -28,6 +28,7 @@ class TrafficTarget:
     worker_count: int
     max_queue_size: int
     rate_window_seconds: int = 5
+    update_percent: int = 0
 
     def __post_init__(self) -> None:
         _positive_integer("target_tps", self.target_tps, 1_000_000)
@@ -35,10 +36,18 @@ class TrafficTarget:
         _positive_integer("worker_count", self.worker_count, 256)
         _positive_integer("max_queue_size", self.max_queue_size, 1_000_000)
         _positive_integer("rate_window_seconds", self.rate_window_seconds, 60)
+        if (
+            not isinstance(self.update_percent, int)
+            or isinstance(self.update_percent, bool)
+            or not 0 <= self.update_percent <= 100
+        ):
+            raise ValueError("update_percent must be an integer between 0 and 100")
 
 
 class TrafficWorker(Protocol):
     def write(self, table_index: int, rows: int) -> int: ...
+
+    def update(self, table_index: int, rows: int, target_index: int) -> int: ...
 
     def close(self) -> None: ...
 
@@ -84,6 +93,8 @@ class TrafficSnapshot:
     scheduled_transactions: int
     started_transactions: int
     committed_transactions: int
+    committed_insert_transactions: int
+    committed_update_transactions: int
     failed_transactions: int
     rejected_transactions: int
     committed_rows: int
@@ -110,6 +121,8 @@ class _TrafficCounters:
         self._scheduled = 0
         self._started = 0
         self._committed = 0
+        self._committed_inserts = 0
+        self._committed_updates = 0
         self._failed = 0
         self._rejected = 0
         self._rows = 0
@@ -136,9 +149,19 @@ class _TrafficCounters:
             self._started += 1
             self._in_flight += 1
 
-    def committed(self, at_ns: int, rows: int, latency_ms: float) -> None:
+    def committed(
+        self,
+        at_ns: int,
+        rows: int,
+        latency_ms: float,
+        operation: Literal["insert", "update"],
+    ) -> None:
         with self._lock:
             self._committed += 1
+            if operation == "insert":
+                self._committed_inserts += 1
+            else:
+                self._committed_updates += 1
             self._rows += rows
             self._in_flight -= 1
             self._commits.append((at_ns, rows))
@@ -167,9 +190,14 @@ class _TrafficCounters:
         rows: int,
         latency_ms: float,
         error: BaseException,
+        operation: Literal["insert", "update"],
     ) -> None:
         with self._lock:
             self._committed += 1
+            if operation == "insert":
+                self._committed_inserts += 1
+            else:
+                self._committed_updates += 1
             self._rows += rows
             self._in_flight -= 1
             self._commits.append((at_ns, rows))
@@ -224,6 +252,8 @@ class _TrafficCounters:
                 scheduled_transactions=self._scheduled,
                 started_transactions=self._started,
                 committed_transactions=self._committed,
+                committed_insert_transactions=self._committed_inserts,
+                committed_update_transactions=self._committed_updates,
                 failed_transactions=self._failed,
                 rejected_transactions=self._rejected,
                 committed_rows=self._rows,
@@ -242,6 +272,8 @@ class _TrafficCounters:
 class _TransactionIntent:
     table_index: int
     rows: int
+    operation: Literal["insert", "update"]
+    update_target_index: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,6 +320,7 @@ class TrafficLane:
         def schedule() -> None:
             pacer = PacedArrivals(start_ns)
             sequence = 0
+            update_positions = [0] * table_count
             pending: list[_TransactionIntent] = []
             try:
                 while not scheduler_stop.is_set():
@@ -302,10 +335,21 @@ class TrafficLane:
                     counters.offered(emitted + missed)
                     counters.rejected(missed)
                     for _ in range(emitted):
+                        table_index = sequence % table_count
+                        is_update = (
+                            ((sequence + 1) * target.update_percent) // 100
+                            > (sequence * target.update_percent) // 100
+                        )
+                        update_target_index = None
+                        if is_update:
+                            update_target_index = update_positions[table_index]
+                            update_positions[table_index] += 1
                         pending.append(
                             _TransactionIntent(
-                                sequence % table_count,
+                                table_index,
                                 target.rows_per_transaction,
+                                "update" if is_update else "insert",
+                                update_target_index,
                             )
                         )
                         sequence += 1
@@ -345,10 +389,19 @@ class TrafficLane:
                         transaction_start = time.monotonic_ns()
                         abort_batch = False
                         try:
-                            inserted = worker.write(intent.table_index, intent.rows)
-                            if inserted != intent.rows:
+                            if intent.operation == "update":
+                                if intent.update_target_index is None:
+                                    raise RuntimeError("update target index is missing")
+                                affected = worker.update(
+                                    intent.table_index,
+                                    intent.rows,
+                                    intent.update_target_index,
+                                )
+                            else:
+                                affected = worker.write(intent.table_index, intent.rows)
+                            if affected != intent.rows:
                                 raise RuntimeError(
-                                    f"transaction inserted {inserted} rows; expected {intent.rows}"
+                                    f"transaction affected {affected} rows; expected {intent.rows}"
                                 )
                         except CommittedTrafficWorkerError as error:
                             completed_ns = time.monotonic_ns()
@@ -357,6 +410,7 @@ class TrafficLane:
                                 error.committed_rows,
                                 (completed_ns - transaction_start) / 1_000_000,
                                 error,
+                                intent.operation,
                             )
                             scheduler_stop.set()
                             workers_stop.set()
@@ -381,8 +435,9 @@ class TrafficLane:
                             completed_ns = time.monotonic_ns()
                             counters.committed(
                                 completed_ns,
-                                inserted,
+                                affected,
                                 (completed_ns - transaction_start) / 1_000_000,
+                                intent.operation,
                             )
                         if abort_batch:
                             counters.rejected(len(batch.operations) - index - 1)

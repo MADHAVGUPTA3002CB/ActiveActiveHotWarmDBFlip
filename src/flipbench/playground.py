@@ -55,6 +55,9 @@ class WorkloadSettings:
     retiring_target_tps: int = 1_364
     active_rows_per_transaction: int = 1
     retiring_rows_per_transaction: int = 1
+    active_update_percent: int = 0
+    retiring_update_percent: int = 0
+    update_seed_rows_per_table: int = 1_000
     active_workers: int = 32
     retiring_workers: int = 8
     max_queue_size: int = 30_000
@@ -104,6 +107,27 @@ class WorkloadSettings:
             )
         _bounded_integer("active_target_tps", self.active_target_tps, 1, 1_000_000)
         _bounded_integer("retiring_target_tps", self.retiring_target_tps, 1, 1_000_000)
+        _bounded_integer("active_update_percent", self.active_update_percent, 0, 100)
+        _bounded_integer("retiring_update_percent", self.retiring_update_percent, 0, 100)
+        _bounded_integer(
+            "update_seed_rows_per_table",
+            self.update_seed_rows_per_table,
+            1,
+            100_000,
+        )
+        has_updates = self.active_update_percent > 0 or self.retiring_update_percent > 0
+        if has_updates and self.mode != "target_rate_v1":
+            raise ValueError("UPDATE traffic requires target-rate workload mode")
+        if (
+            self.active_update_percent > 0
+            and self.update_seed_rows_per_table < self.active_rows_per_transaction
+        ) or (
+            self.retiring_update_percent > 0
+            and self.update_seed_rows_per_table < self.retiring_rows_per_transaction
+        ):
+            raise ValueError(
+                "update seed rows per table must cover rows per UPDATE transaction"
+            )
         self.active_target()
         self.retiring_target()
         _bounded_integer("min_achievement_percent", self.min_achievement_percent, 1, 100)
@@ -136,20 +160,22 @@ class WorkloadSettings:
 
     def active_target(self) -> TrafficTarget:
         return TrafficTarget(
-            self.active_target_tps,
-            self.active_rows_per_transaction,
-            self.active_workers,
-            self.max_queue_size,
-            self.rate_window_seconds,
+            target_tps=self.active_target_tps,
+            rows_per_transaction=self.active_rows_per_transaction,
+            worker_count=self.active_workers,
+            max_queue_size=self.max_queue_size,
+            rate_window_seconds=self.rate_window_seconds,
+            update_percent=self.active_update_percent,
         )
 
     def retiring_target(self) -> TrafficTarget:
         return TrafficTarget(
-            self.retiring_target_tps,
-            self.retiring_rows_per_transaction,
-            self.retiring_workers,
-            self.max_queue_size,
-            self.rate_window_seconds,
+            target_tps=self.retiring_target_tps,
+            rows_per_transaction=self.retiring_rows_per_transaction,
+            worker_count=self.retiring_workers,
+            max_queue_size=self.max_queue_size,
+            rate_window_seconds=self.rate_window_seconds,
+            update_percent=self.retiring_update_percent,
         )
 
     def to_dict(self) -> dict[str, int | str]:

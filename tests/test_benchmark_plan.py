@@ -131,6 +131,19 @@ class BenchmarkPlanTests(unittest.TestCase):
             "state_and_epoch_v1",
         )
 
+    def test_accepts_generic_insert_update_mix_for_benchmark_plans(self) -> None:
+        payload = valid_plan()
+        payload["workload"].update(  # type: ignore[union-attr]
+            active_update_percent=50,
+            retiring_update_percent=20,
+            update_seed_rows_per_table=100,
+        )
+        plan = self.load(payload)
+
+        self.assertEqual(plan.workload.active_update_percent, 50)
+        self.assertEqual(plan.workload.retiring_update_percent, 20)
+        self.assertEqual(plan.workload.update_seed_rows_per_table, 100)
+
     def test_rejects_unknown_duplicate_or_unsafe_plan_values(self) -> None:
         for mutate, message in (
             (lambda value: value.update(variants=["D", "unknown"]), "variant"),

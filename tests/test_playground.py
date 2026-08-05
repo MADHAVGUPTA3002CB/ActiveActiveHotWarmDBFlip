@@ -150,6 +150,41 @@ class WorkloadSettingsTests(unittest.TestCase):
             "state_only_v1",
         )
 
+    def test_accepts_the_same_independent_update_mix_for_every_target_rate_fence(self) -> None:
+        for fence_mode, admission_mode in (
+            ("warm_tracker_advisory_v1", "state_and_epoch_v1"),
+            ("hot_transactional_v1", "state_and_epoch_v1"),
+            ("optimistic_detach_v1", "state_and_epoch_v1"),
+            ("optimistic_detach_v1", "state_only_v1"),
+        ):
+            with self.subTest(fence_mode=fence_mode, admission_mode=admission_mode):
+                settings = WorkloadSettings(
+                    mode="target_rate_v1",
+                    write_fence_mode=fence_mode,
+                    optimistic_admission_check_mode=admission_mode,
+                    active_update_percent=50,
+                    retiring_update_percent=25,
+                    update_seed_rows_per_table=100,
+                )
+                self.assertEqual(settings.active_target().update_percent, 50)
+                self.assertEqual(settings.retiring_target().update_percent, 25)
+                self.assertEqual(settings.to_dict()["update_seed_rows_per_table"], 100)
+
+    def test_update_mix_requires_target_rate_mode_and_enough_seed_rows(self) -> None:
+        with self.assertRaisesRegex(ValueError, "target-rate"):
+            WorkloadSettings(active_update_percent=50)
+        with self.assertRaisesRegex(ValueError, "seed rows"):
+            WorkloadSettings(
+                mode="target_rate_v1",
+                write_fence_mode="optimistic_detach_v1",
+                optimistic_admission_check_mode="state_only_v1",
+                active_rows_per_transaction=3,
+                active_update_percent=50,
+                update_seed_rows_per_table=2,
+            )
+        with self.assertRaisesRegex(ValueError, "active_update_percent"):
+            WorkloadSettings(active_update_percent=101)
+
     def test_rejects_state_only_admission_without_optimistic_detach(self) -> None:
         with self.assertRaisesRegex(ValueError, "state_only_v1"):
             WorkloadSettings(

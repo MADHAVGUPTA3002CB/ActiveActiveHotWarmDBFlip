@@ -69,6 +69,10 @@ flowchart TB
 
 Hot holds the active and retiring leaf partitions. It also holds the local write gate used by variants D–H and the marker tables used by variants F–H. D checks state and epoch per operation; E–G check them once per API batch; H checks only the open state once per API batch. Detach operations change the routing catalog: once a leaf is detached, writes routed through its former parent no longer reach it.
 
+For indexed workload-mix experiments across A–H, the control plane first inserts an unmeasured seed pool into every selected timeslot/table. The single lane scheduler deterministically labels each transaction as INSERT or UPDATE and assigns UPDATE target positions independently per table. Worker sessions update `payload` and `updated_at` through the partitioned parent using the immutable `(id, created_at)` key while preserving that variant's existing warm-tracker, hot-epoch, or optimistic-batch guard. A zero-row update after detach is converted into the same fail-closed writer-park result as an insert/detach race.
+
+See [Load generator](load-generator.md) for the complete row model, pacing formula, API-batch shape, queue/worker behavior, INSERT/UPDATE selection, ownership checks, flip races, and metric definitions.
+
 ### Debezium source and Kafka
 
 Debezium reads PostgreSQL logical decoding from a slot whose publication controls which changes are emitted. With `publish_via_partition_root=false`, each leaf remains a separate source relation and is routed to its own canonical topic. Every leaf topic has one Kafka partition, preserving the leaf-local order used by marker proofs.

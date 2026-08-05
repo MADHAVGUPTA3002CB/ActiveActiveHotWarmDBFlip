@@ -26,7 +26,7 @@ flowchart LR
 
 The selected CDC layout uses `publish_via_partition_root=false`: every PostgreSQL leaf has its own Kafka topic and every leaf topic has exactly one Kafka partition. Active traffic continues while only the retiring timeslot is fenced, detached, drained, and granted to warm ownership.
 
-The prototype supports 5, 10, 15, or 20 partitioned tables and variants A through H. See [Architecture](docs/architecture.md) and [Variant reference](docs/variants.md) for the detailed flow and correctness contracts.
+The prototype supports 5, 10, 15, or 20 partitioned tables and variants A through H. See [Architecture](docs/architecture.md), [Load generator](docs/load-generator.md), and [Variant reference](docs/variants.md) for the detailed flow, workload model, and correctness contracts.
 
 ## Prerequisites
 
@@ -85,6 +85,8 @@ Open [http://localhost:3000](http://localhost:3000). Keep that terminal running 
 5. Use **New experiment** for a clean RF3 generation. It requires typing `RESET` and preserves host-side result files.
 
 The UI controls real local services. A requested TPS value is a target; achieved TPS depends on the host and may be lower.
+
+Every target-rate variant supports the same indexed INSERT/UPDATE workload mix. Set the active and retiring **UPDATE mix** independently; the remaining percentage is INSERT traffic. Before measurement starts, the API seeds the configured number of rows per table, then UPDATE transactions rotate deterministically through those rows using the existing `(id, created_at)` primary-key index. The selected variant still applies its own ownership guard. The default is `0%` UPDATE, so existing INSERT-only benchmarks are unchanged.
 
 ## Faster one-broker profile
 

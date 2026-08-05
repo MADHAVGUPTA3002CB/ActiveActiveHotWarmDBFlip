@@ -176,12 +176,27 @@ class StackContractTests(unittest.TestCase):
                     (settings.writer_database_user, f"public.{manifest.tables[0].parent}"),
                 ).fetchone()[0]
             )
+            self.assertFalse(
+                admin.execute(
+                    "SELECT has_table_privilege(%s, %s, 'UPDATE')",
+                    (settings.writer_database_user, f"public.{manifest.tables[0].parent}"),
+                ).fetchone()[0]
+            )
             self.assertTrue(
                 admin.execute(
                     "SELECT has_function_privilege(%s, %s, 'EXECUTE')",
                     (
                         settings.writer_database_user,
                         "flipbench_guard.insert_events_optimistic(text,text,name,jsonb)",
+                    ),
+                ).fetchone()[0]
+            )
+            self.assertTrue(
+                admin.execute(
+                    "SELECT has_function_privilege(%s, %s, 'EXECUTE')",
+                    (
+                        settings.writer_database_user,
+                        "flipbench_guard.update_events_optimistic(text,text,name,jsonb)",
                     ),
                 ).fetchone()[0]
             )
@@ -352,6 +367,202 @@ class StackContractTests(unittest.TestCase):
                         attempt_id,
                         None,
                     )
+                for route in manifest.tables:
+                    admin.execute(
+                        sql.SQL("DELETE FROM {} WHERE experiment_run_id=%s").format(
+                            sql.Identifier(route.leaf)
+                        ),
+                        (run_id,),
+                    )
+
+    def test_h_indexed_update_rotates_seeded_rows_and_fails_closed_after_detach(self) -> None:
+        from psycopg import sql
+
+        from flipbench.core import build_manifest
+        from flipbench.postgres_io import (
+            OptimisticDetachTransactionSession,
+            connect,
+            seed_update_targets,
+        )
+        from flipbench.settings import Settings
+
+        settings = Settings.from_env(5)
+        manifest = build_manifest(5, settings.cell, settings.timeslot)
+        route = manifest.tables[0]
+        run_id = uuid.uuid4()
+        targets = seed_update_targets(
+            settings.hot_dsn,
+            manifest,
+            run_id,
+            rows_per_table=3,
+            timeslot="retiring",
+            payload_bytes=64,
+        )
+        session = OptimisticDetachTransactionSession(
+            settings.writer_hot_dsn,
+            manifest,
+            run_id,
+            "retiring",
+            64,
+            expected_ownership_epoch=None,
+            operations_per_batch=1,
+            admission_check_mode="state_only_v1",
+            update_targets_by_table=targets,
+        )
+        with connect(settings.hot_dsn, autocommit=True) as admin:
+            try:
+                self.assertTrue(
+                    admin.execute(
+                        "SELECT has_function_privilege(%s, %s, 'EXECUTE')",
+                        (
+                            settings.writer_database_user,
+                            "flipbench_guard.update_events_optimistic(text,text,name,jsonb)",
+                        ),
+                    ).fetchone()[0]
+                )
+                self.assertEqual(session.update(0, 1, 0), 1)
+                updated_payload = admin.execute(
+                    sql.SQL(
+                        "SELECT payload FROM {} WHERE id=%s AND created_at=%s"
+                    ).format(sql.Identifier(route.parent)),
+                    (targets[0][0].id, targets[0][0].created_at),
+                ).fetchone()[0]
+                self.assertIn("update_sequence_no", updated_payload)
+                deadline = time.monotonic() + 20
+                with connect(settings.warm_dsn, autocommit=True) as warm:
+                    while time.monotonic() < deadline:
+                        warm_row = warm.execute(
+                            sql.SQL(
+                                "SELECT payload FROM {} WHERE id=%s AND created_at=%s"
+                            ).format(sql.Identifier(route.parent)),
+                            (targets[0][0].id, targets[0][0].created_at),
+                        ).fetchone()
+                        if warm_row is not None and "update_sequence_no" in warm_row[0]:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        self.fail("warm JDBC sink did not apply the seeded-row UPDATE")
+                indexes = admin.execute(
+                    "SELECT indexdef FROM pg_indexes WHERE schemaname='public' AND tablename=%s",
+                    (route.leaf,),
+                ).fetchall()
+                self.assertTrue(
+                    any("(id, created_at)" in definition for (definition,) in indexes)
+                )
+
+                admin.execute(
+                    sql.SQL("ALTER TABLE {} DETACH PARTITION {}").format(
+                        sql.Identifier(route.parent),
+                        sql.Identifier(route.leaf),
+                    )
+                )
+                with self.assertRaisesRegex(RuntimeError, "hot writer parked"):
+                    session.update(0, 1, 1)
+            finally:
+                session.close()
+                attached = admin.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_inherits
+                        WHERE inhparent=%s::regclass AND inhrelid=%s::regclass
+                    )
+                    """,
+                    (f"public.{route.parent}", f"public.{route.leaf}"),
+                ).fetchone()[0]
+                if not attached:
+                    admin.execute(
+                        sql.SQL(
+                            "ALTER TABLE {} ATTACH PARTITION {} "
+                            "FOR VALUES FROM ('2026-07-31 12:00:00+00') "
+                            "TO ('2026-08-01 00:00:00+00')"
+                        ).format(
+                            sql.Identifier(route.parent),
+                            sql.Identifier(route.leaf),
+                        )
+                    )
+                for table_route in manifest.tables:
+                    admin.execute(
+                        sql.SQL("DELETE FROM {} WHERE experiment_run_id=%s").format(
+                            sql.Identifier(table_route.leaf)
+                        ),
+                        (run_id,),
+                    )
+
+    def test_indexed_update_mix_uses_each_variants_existing_ownership_guard(self) -> None:
+        from psycopg import sql
+
+        from flipbench.core import build_manifest
+        from flipbench.postgres_io import (
+            GuardedTransactionSession,
+            HotFencedTransactionSession,
+            connect,
+            hot_write_gate_status,
+            seed_update_targets,
+        )
+        from flipbench.settings import Settings
+
+        settings = Settings.from_env(5)
+        manifest = build_manifest(5, settings.cell, settings.timeslot)
+        run_id = uuid.uuid4()
+        targets = seed_update_targets(
+            settings.hot_dsn,
+            manifest,
+            run_id,
+            rows_per_table=3,
+            timeslot="retiring",
+            payload_bytes=64,
+        )
+        with connect(settings.hot_dsn, autocommit=True) as admin:
+            gate = hot_write_gate_status(admin, settings.cell, "retiring")
+            self.assertTrue(
+                admin.execute(
+                    "SELECT has_function_privilege(%s, %s, 'EXECUTE')",
+                    (
+                        settings.writer_database_user,
+                        "flipbench_guard.update_events(text,text,bigint,name,jsonb)",
+                    ),
+                ).fetchone()[0]
+            )
+
+        warm_guarded = GuardedTransactionSession(
+            settings.hot_dsn,
+            settings.warm_dsn,
+            manifest,
+            run_id,
+            "retiring",
+            64,
+            update_targets_by_table=targets,
+        )
+        hot_guarded = HotFencedTransactionSession(
+            settings.writer_hot_dsn,
+            manifest,
+            run_id,
+            "retiring",
+            64,
+            gate.ownership_epoch,
+            update_targets_by_table=targets,
+        )
+        try:
+            self.assertEqual(warm_guarded.update(0, 1, 0), 1)
+            self.assertEqual(hot_guarded.update(1, 1, 0), 1)
+        finally:
+            warm_guarded.close()
+            hot_guarded.close()
+
+        with connect(settings.hot_dsn, autocommit=True) as admin:
+            try:
+                for table_index in (0, 1):
+                    payload = admin.execute(
+                        sql.SQL(
+                            "SELECT payload FROM {} WHERE id=%s AND created_at=%s"
+                        ).format(sql.Identifier(manifest.tables[table_index].parent)),
+                        (
+                            targets[table_index][0].id,
+                            targets[table_index][0].created_at,
+                        ),
+                    ).fetchone()[0]
+                    self.assertIn("update_sequence_no", payload)
+            finally:
                 for route in manifest.tables:
                     admin.execute(
                         sql.SQL("DELETE FROM {} WHERE experiment_run_id=%s").format(

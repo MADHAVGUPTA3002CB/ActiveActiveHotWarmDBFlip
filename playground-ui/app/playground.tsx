@@ -38,6 +38,9 @@ type Settings = {
   retiring_target_tps: number;
   active_rows_per_transaction: number;
   retiring_rows_per_transaction: number;
+  active_update_percent: number;
+  retiring_update_percent: number;
+  update_seed_rows_per_table: number;
   active_workers: number;
   retiring_workers: number;
   max_queue_size: number;
@@ -51,6 +54,8 @@ type TrafficSnapshot = {
   scheduled_transactions: number;
   started_transactions: number;
   committed_transactions: number;
+  committed_insert_transactions: number;
+  committed_update_transactions: number;
   failed_transactions: number;
   rejected_transactions: number;
   committed_rows: number;
@@ -473,6 +478,9 @@ export function Playground() {
   const detachEvents = state?.flip.events.filter((event) => event.stage.startsWith("t4_")) ?? [];
   const detachDone = state ? detachEvents.length >= state.environment.table_count : false;
   const optimisticDetach = workload?.write_fence_mode === "optimistic_detach_v1";
+  const stateOnlyVariantH = optimisticDetach && workload?.optimistic_admission_check_mode === "state_only_v1";
+  const effectiveSourceProofMode = stateOnlyVariantH ? "parallel_atomic_detach_marker_v1" : sourceProofMode;
+  const effectiveFenceWakeupMode = stateOnlyVariantH ? "passive" : fenceWakeupMode;
   const hotGateMode = workload?.write_fence_mode === "hot_transactional_v1" || optimisticDetach;
   const visibleStages = optimisticDetach ? [
     ["t1", "Admit", "Thresholds proved"],
@@ -480,9 +488,9 @@ export function Playground() {
     ["t2f", "Fence", "New retiring APIs stopped"],
     ["t4", "Detach", "Leaves detached"],
     ["t2q", "Resolve", "In-flight APIs finished or rolled back"],
-    ["t7", "Source proof", sourceProofMode !== "slot_lsn_v1" ? "Leaf markers observed" : "WAL fence reached"],
-    ["t8", "Capture E", sourceProofMode !== "slot_lsn_v1" ? "Marker offsets persisted" : "Kafka targets frozen"],
-    ["t11", "Sink proof", sourceProofMode !== "slot_lsn_v1" ? "Warm receipts visible" : "Warm offsets reached"],
+    ["t7", "Source proof", effectiveSourceProofMode !== "slot_lsn_v1" ? "Leaf markers observed" : "WAL fence reached"],
+    ["t8", "Capture E", effectiveSourceProofMode !== "slot_lsn_v1" ? "Marker offsets persisted" : "Kafka targets frozen"],
+    ["t11", "Sink proof", effectiveSourceProofMode !== "slot_lsn_v1" ? "Warm receipts visible" : "Warm offsets reached"],
     ["t13", "Grant", "Warm owns data"],
   ] as const : STAGES;
   const stageComplete = (stage: string) => stage === "t4" ? detachDone : completedStages.has(stage);
@@ -601,7 +609,10 @@ export function Playground() {
               </select></div></label>
               {workload.write_fence_mode === "optimistic_detach_v1" && <label className="field"><span>API batch admission check</span><div className="select-shell"><select value={workload.optimistic_admission_check_mode} disabled={state.workload.running || controlsDisabled} onChange={(event) => {
                 const mode = event.target.value as Settings["optimistic_admission_check_mode"];
-                setWorkload({ ...workload, optimistic_admission_check_mode: mode });
+                setWorkload({
+                  ...workload,
+                  optimistic_admission_check_mode: mode,
+                });
                 if (mode === "state_only_v1") {
                   setSourceProofMode("parallel_atomic_detach_marker_v1");
                   setFenceWakeupMode("passive");
@@ -622,6 +633,14 @@ export function Playground() {
                 <NumberField label="Active rows / transaction" value={workload.active_rows_per_transaction} min={1} max={100_000} onChange={(value) => setWorkload({ ...workload, active_rows_per_transaction: value })} />
                 <NumberField label="Retiring rows / transaction" value={workload.retiring_rows_per_transaction} min={1} max={100_000} onChange={(value) => setWorkload({ ...workload, retiring_rows_per_transaction: value })} />
               </div>
+              <>
+                <div className="field-grid two">
+                  <NumberField label="Active UPDATE mix" value={workload.active_update_percent} unit="%" min={0} max={100} disabled={state.workload.running} onChange={(value) => setWorkload({ ...workload, active_update_percent: value })} />
+                  <NumberField label="Retiring UPDATE mix" value={workload.retiring_update_percent} unit="%" min={0} max={100} disabled={state.workload.running} onChange={(value) => setWorkload({ ...workload, retiring_update_percent: value })} />
+                </div>
+                <NumberField label="Seed rows / table for UPDATE" value={workload.update_seed_rows_per_table} min={1} max={100_000} disabled={state.workload.running} onChange={(value) => setWorkload({ ...workload, update_seed_rows_per_table: value })} />
+                <div className="info-note"><CircleAlert size={14} /><span>The same INSERT/UPDATE mix is used for every variant. Seed rows are inserted before measurement; UPDATEs rotate through each table&apos;s (id, created_at) primary keys while the selected variant keeps its own ownership guard.</span></div>
+              </>
               <div className="field-grid two">
                 <NumberField label="Active DB workers" value={workload.active_workers} min={1} max={63} disabled={state.workload.running} onChange={(value) => setWorkload({ ...workload, active_workers: value })} />
                 <NumberField label="Retiring DB workers" value={workload.retiring_workers} min={1} max={63} disabled={state.workload.running} onChange={(value) => setWorkload({ ...workload, retiring_workers: value })} />
@@ -666,11 +685,11 @@ export function Playground() {
               <NumberField label="Park budget" value={thresholds.park_budget_ms} unit="ms" min={100} onChange={(value) => setThresholds({ ...thresholds, park_budget_ms: value })} />
               <NumberField label="Revert reserve" value={thresholds.revert_reserve_ms} unit="ms" onChange={(value) => setThresholds({ ...thresholds, revert_reserve_ms: value })} />
             </div>
-            <label className="field"><span>Fence wake-up experiment</span><div className="select-shell"><select value={fenceWakeupMode} disabled={controlsDisabled || state.flip.status === "running" || workload.optimistic_admission_check_mode === "state_only_v1"} onChange={(event) => setFenceWakeupMode(event.target.value as "passive" | "immediate_heartbeat")}>
+            <label className="field"><span>Fence wake-up experiment</span><div className="select-shell"><select value={effectiveFenceWakeupMode} disabled={controlsDisabled || state.flip.status === "running" || workload.optimistic_admission_check_mode === "state_only_v1"} onChange={(event) => setFenceWakeupMode(event.target.value as "passive" | "immediate_heartbeat")}>
               <option value="passive">{state.environment.source_topology === "isolated" ? "B — Passive heartbeat (control)" : "A — Passive heartbeat (control)"}</option>
               <option value="immediate_heartbeat">{state.environment.source_topology === "isolated" ? "B+ — Immediate fence nudge" : "A+ — Immediate fence nudge"}</option>
             </select></div></label>
-            <label className="field"><span>Source and sink proof</span><div className="select-shell"><select value={sourceProofMode} disabled={controlsDisabled || state.flip.status === "running"} onChange={(event) => {
+            <label className="field"><span>Source and sink proof</span><div className="select-shell"><select value={effectiveSourceProofMode} disabled={controlsDisabled || state.flip.status === "running" || stateOnlyVariantH} onChange={(event) => {
               const mode = event.target.value as "slot_lsn_v1" | "per_leaf_marker_v1" | "atomic_detach_marker_v1" | "parallel_atomic_detach_marker_v1";
               setSourceProofMode(mode);
               if (mode !== "slot_lsn_v1") setFenceWakeupMode("passive");
@@ -680,7 +699,7 @@ export function Playground() {
               <option value="atomic_detach_marker_v1" disabled={state.environment.source_topology !== "isolated" || workload.write_fence_mode !== "optimistic_detach_v1" || workload.optimistic_admission_check_mode !== "state_and_epoch_v1"}>G — Atomic detach + per-leaf marker</option>
               <option value="parallel_atomic_detach_marker_v1" disabled={state.environment.source_topology !== "isolated" || workload.write_fence_mode !== "optimistic_detach_v1" || workload.optimistic_admission_check_mode !== "state_only_v1"}>H — Parallel atomic detach + markers</option>
             </select></div></label>
-            <div className="info-note"><CircleAlert size={14} /><span>{sourceProofMode === "parallel_atomic_detach_marker_v1" ? "Variant H starts one independent detach + marker transaction for every retiring leaf at the same time. If any leaf fails, all workers finish and every detached leaf is reattached before the gate reopens." : sourceProofMode === "atomic_detach_marker_v1" ? "Variant G commits each blocking leaf detach and its unique CDC marker in the same hot PostgreSQL transaction, then waits for that exact marker in Kafka and warm PostgreSQL." : sourceProofMode === "per_leaf_marker_v1" ? "Variant F emits one durable PostgreSQL marker per retiring leaf after concurrent detaches, observes its exact Kafka offset, and waits for the matching warm JDBC receipt." : "The existing proof waits for the migration slot LSN and then the JDBC sink consumer offsets."}</span></div>
+            <div className="info-note"><CircleAlert size={14} /><span>{effectiveSourceProofMode === "parallel_atomic_detach_marker_v1" ? "Variant H starts one independent detach + marker transaction for every retiring leaf at the same time. If any leaf fails, all workers finish and every detached leaf is reattached before the gate reopens." : effectiveSourceProofMode === "atomic_detach_marker_v1" ? "Variant G commits each blocking leaf detach and its unique CDC marker in the same hot PostgreSQL transaction, then waits for that exact marker in Kafka and warm PostgreSQL." : effectiveSourceProofMode === "per_leaf_marker_v1" ? "Variant F emits one durable PostgreSQL marker per retiring leaf after concurrent detaches, observes its exact Kafka offset, and waits for the matching warm JDBC receipt." : "The existing proof waits for the migration slot LSN and then the JDBC sink consumer offsets."}</span></div>
             <button className="button secondary full" type="submit" disabled={controlsDisabled}>
               {pending === "thresholds" ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />} Apply thresholds
             </button>
@@ -720,6 +739,7 @@ export function Playground() {
                 <div className="threshold-line"><span>{formatNumber(latest.transactions.achievement_percent)}% of target</span><span>{latest.transactions.rate_valid ? "admissible" : "below minimum"}</span></div>
                 <div className="meter"><i style={{ width: `${Math.min(100, latest.transactions.achievement_percent)}%` }} /></div>
                 <div className="totals"><span>{formatNumber(latest.active_transactions_per_second)} active TPS</span><span>{formatNumber(latest.retiring_transactions_per_second)} retiring TPS</span></div>
+                <div className="totals"><span>{formatNumber(latest.transactions.active.committed_insert_transactions + latest.transactions.retiring.committed_insert_transactions)} INSERT commits</span><span>{formatNumber(latest.transactions.active.committed_update_transactions + latest.transactions.retiring.committed_update_transactions)} UPDATE commits</span></div>
                 <div className="totals"><span>{formatNumber(latest.transactions.active.queue_depth + latest.transactions.retiring.queue_depth)} queued</span><span>{formatNumber(latest.transactions.active.rejected_transactions + latest.transactions.retiring.rejected_transactions)} rejected/missed</span></div>
                 <div className="totals"><span>p95 {formatNumber(Math.max(latest.transactions.active.latency_p95_ms, latest.transactions.retiring.latency_p95_ms))} ms</span><span>{formatNumber(latest.active_rows_per_second + latest.retiring_rows_per_second)} rows/s</span></div>
               </> : <>
@@ -740,9 +760,9 @@ export function Playground() {
                 {latest?.admission_ready ? <ShieldCheck size={20} /> : <Pause size={20} />}
                 <div><strong>{latest?.admission_ready ? "Admission ready" : "Waiting for admission"}</strong><span>{latest?.healthy_samples ?? 0} / {thresholds.stable_samples} healthy samples</span></div>
               </div>
-              <button className="flip-button" disabled={!flipAllowed || controlsDisabled} onClick={() => act("flip", () => request("/flip/start", { method: "POST", body: JSON.stringify({ fence_wakeup_mode: fenceWakeupMode, source_proof_mode: sourceProofMode }) }))}>
+              <button className="flip-button" disabled={!flipAllowed || controlsDisabled} onClick={() => act("flip", () => request("/flip/start", { method: "POST", body: JSON.stringify({ fence_wakeup_mode: effectiveFenceWakeupMode, source_proof_mode: effectiveSourceProofMode }) }))}>
                 {state.flip.status === "running" || pending === "flip" ? <LoaderCircle className="spin" size={18} /> : <Zap size={18} fill="currentColor" />}
-                {state.flip.status === "running" ? "Flipping…" : `Start flip · ${sourceProofMode === "parallel_atomic_detach_marker_v1" ? "H" : sourceProofMode === "atomic_detach_marker_v1" ? "G" : sourceProofMode === "per_leaf_marker_v1" ? "F" : workload.write_fence_mode === "optimistic_detach_v1" ? "E" : workload.write_fence_mode === "hot_transactional_v1" ? "D" : fenceWakeupMode === "immediate_heartbeat" ? `${state.environment.source_topology === "isolated" ? "B+" : "A+"}` : `${state.environment.source_topology === "isolated" ? "B" : "A"}`}`}
+                {state.flip.status === "running" ? "Flipping…" : `Start flip · ${effectiveSourceProofMode === "parallel_atomic_detach_marker_v1" ? "H" : effectiveSourceProofMode === "atomic_detach_marker_v1" ? "G" : effectiveSourceProofMode === "per_leaf_marker_v1" ? "F" : workload.write_fence_mode === "optimistic_detach_v1" ? "E" : workload.write_fence_mode === "hot_transactional_v1" ? "D" : effectiveFenceWakeupMode === "immediate_heartbeat" ? `${state.environment.source_topology === "isolated" ? "B+" : "A+"}` : `${state.environment.source_topology === "isolated" ? "B" : "A"}`}`}
                 <ArrowRight size={17} />
               </button>
             </div>
@@ -769,7 +789,7 @@ export function Playground() {
                   ...(hotGateMode ? [["Hot ownership fence", "hot_fence_park_ns", "t2 → t2h"]] : []),
                   ...(optimisticDetach ? [["Admission stop", "admission_fence_ns", "t2w → t2f"], ["In-flight resolution", "in_flight_resolution_ns", "t2f → t2q"]] : []),
                   ["Source fence proof", "source_proof_ns", "t5 → t7"],
-                  ...(sourceProofMode === "parallel_atomic_detach_marker_v1" ? [["Parallel detach + markers", "parallel_detach_wall_ns", "all t3 → t4"], ["Marker delivery wait", "slot_wait_after_wakeup_ns", "t6w → t7"]] : sourceProofMode === "atomic_detach_marker_v1" ? [["Atomic detach + markers", "atomic_detach_marker_ns", "Σ t3 → t4"], ["Marker delivery wait", "slot_wait_after_wakeup_ns", "t6w → t7"]] : sourceProofMode === "per_leaf_marker_v1" ? [["Marker emission", "fence_wakeup_ns", "t6 → t6w"], ["Marker delivery wait", "slot_wait_after_wakeup_ns", "t6w → t7"]] : [["Fence wake-up", "fence_wakeup_ns", "t6 → t6w"], ["Slot wait after wake-up", "slot_wait_after_wakeup_ns", "t6w → t7"]]),
+                  ...(effectiveSourceProofMode === "parallel_atomic_detach_marker_v1" ? [["Parallel detach + markers", "parallel_detach_wall_ns", "all t3 → t4"], ["Marker delivery wait", "slot_wait_after_wakeup_ns", "t6w → t7"]] : effectiveSourceProofMode === "atomic_detach_marker_v1" ? [["Atomic detach + markers", "atomic_detach_marker_ns", "Σ t3 → t4"], ["Marker delivery wait", "slot_wait_after_wakeup_ns", "t6w → t7"]] : effectiveSourceProofMode === "per_leaf_marker_v1" ? [["Marker emission", "fence_wakeup_ns", "t6 → t6w"], ["Marker delivery wait", "slot_wait_after_wakeup_ns", "t6w → t7"]] : [["Fence wake-up", "fence_wakeup_ns", "t6 → t6w"], ["Slot wait after wake-up", "slot_wait_after_wakeup_ns", "t6w → t7"]]),
                   ["Capture E", "capture_e_ns", "t7 → t8"],
                   ["Warm sink proof", "sink_proof_ns", "t8 → t11"],
                   ["Ownership grant", "grant_ns", "t11 → t13"],

@@ -40,6 +40,7 @@ from .postgres_io import (
     guarded_insert_events,
     hot_write_gate_status,
     reconcile_hot_write_gate,
+    seed_update_targets,
     slot_status,
 )
 from .settings import Settings
@@ -306,6 +307,9 @@ class PlaygroundRuntime:
                     "payload_bytes",
                     "write_fence_mode",
                     "optimistic_admission_check_mode",
+                    "active_update_percent",
+                    "retiring_update_percent",
+                    "update_seed_rows_per_table",
                 }
                 changed = {
                     field for field in frozen_fields if current[field] != updated.to_dict()[field]
@@ -367,6 +371,26 @@ class PlaygroundRuntime:
 
             workload_settings = self.workload.settings()
             if workload_settings.mode == "target_rate_v1":
+                active_update_targets = ()
+                retiring_update_targets = ()
+                if workload_settings.active_update_percent > 0:
+                    active_update_targets = seed_update_targets(
+                        self.settings.hot_dsn,
+                        self.manifest,
+                        active_run_id,
+                        workload_settings.update_seed_rows_per_table,
+                        "active",
+                        workload_settings.payload_bytes,
+                    )
+                if workload_settings.retiring_update_percent > 0:
+                    retiring_update_targets = seed_update_targets(
+                        self.settings.hot_dsn,
+                        self.manifest,
+                        retiring_run_id,
+                        workload_settings.update_seed_rows_per_table,
+                        "retiring",
+                        workload_settings.payload_bytes,
+                    )
                 hot_gate_mode = workload_settings.write_fence_mode in (
                     WriteFenceMode.HOT_TRANSACTIONAL.value,
                     WriteFenceMode.OPTIMISTIC_DETACH.value,
@@ -394,7 +418,6 @@ class PlaygroundRuntime:
                     admission_check_mode = OptimisticAdmissionCheckMode(
                         workload_settings.optimistic_admission_check_mode
                     )
-
                     def hot_session(
                         target_run_id: uuid.UUID,
                         timeslot: str,
@@ -415,6 +438,11 @@ class PlaygroundRuntime:
                                 ),
                                 operations_per_batch=self.settings.table_count,
                                 admission_check_mode=admission_check_mode,
+                                update_targets_by_table=(
+                                    active_update_targets
+                                    if timeslot == "active"
+                                    else retiring_update_targets
+                                ),
                             )
                         return HotFencedTransactionSession(
                             self.settings.writer_hot_dsn,
@@ -423,6 +451,11 @@ class PlaygroundRuntime:
                             timeslot,
                             workload_settings.payload_bytes,
                             ownership_epoch,
+                            update_targets_by_table=(
+                                active_update_targets
+                                if timeslot == "active"
+                                else retiring_update_targets
+                            ),
                         )
 
                     self.workload.start_target_rate(
@@ -447,6 +480,7 @@ class PlaygroundRuntime:
                             active_run_id,
                             "active",
                             workload_settings.payload_bytes,
+                            update_targets_by_table=active_update_targets,
                         ),
                         lambda: GuardedTransactionSession(
                             self.settings.hot_dsn,
@@ -455,6 +489,7 @@ class PlaygroundRuntime:
                             retiring_run_id,
                             "retiring",
                             workload_settings.payload_bytes,
+                            update_targets_by_table=retiring_update_targets,
                         ),
                         self.settings.table_count,
                         operations_per_api_batch=self.settings.table_count,

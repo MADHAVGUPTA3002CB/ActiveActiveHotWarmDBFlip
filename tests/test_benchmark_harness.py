@@ -105,6 +105,27 @@ class BenchmarkHarnessTests(unittest.TestCase):
             "state_only_v1",
         )
 
+    def test_workload_payload_carries_the_generic_insert_update_mix(self) -> None:
+        payload = valid_plan()
+        payload["variants"] = ["A", "D", "H"]
+        payload["target_tps"] = [1_000]
+        payload["repetitions"] = 1
+        payload["workload"].update(  # type: ignore[union-attr]
+            active_update_percent=50,
+            retiring_update_percent=25,
+            update_seed_rows_per_table=200,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plan.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            plan = load_benchmark_plan(path)
+
+        for case in build_benchmark_cases(plan):
+            workload = HARNESS._workload_payload(plan, case)
+            self.assertEqual(workload["active_update_percent"], 50)
+            self.assertEqual(workload["retiring_update_percent"], 25)
+            self.assertEqual(workload["update_seed_rows_per_table"], 200)
+
     def test_saved_outputs_bind_plan_hash_for_matched_shapes(self) -> None:
         plan = quick_plan()
         cases = build_benchmark_cases(plan)

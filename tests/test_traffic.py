@@ -29,6 +29,10 @@ class TrafficTargetTests(unittest.TestCase):
             TrafficTarget(1, 1, 0, 1)
         with self.assertRaisesRegex(ValueError, "max_queue_size"):
             TrafficTarget(1, 1, 1, 0)
+        with self.assertRaisesRegex(ValueError, "update_percent"):
+            TrafficTarget(1, 1, 1, 1, update_percent=-1)
+        with self.assertRaisesRegex(ValueError, "update_percent"):
+            TrafficTarget(1, 1, 1, 1, update_percent=101)
 
     def test_rejects_booleans_as_numeric_configuration(self) -> None:
         with self.assertRaises(ValueError):
@@ -62,15 +66,31 @@ class PacedArrivalsTests(unittest.TestCase):
 
 
 class _Worker:
-    def __init__(self, committed: list[tuple[int, int]], block: Event | None = None) -> None:
+    def __init__(
+        self,
+        committed: list[tuple[int, int]],
+        block: Event | None = None,
+        operations: list[tuple[str, int, int | None]] | None = None,
+    ) -> None:
         self.committed = committed
         self.block = block
+        self.operations = operations
         self.closed = False
 
     def write(self, table_index: int, rows: int) -> int:
         if self.block is not None:
             self.block.wait(1)
         self.committed.append((table_index, rows))
+        if self.operations is not None:
+            self.operations.append(("insert", table_index, None))
+        return rows
+
+    def update(self, table_index: int, rows: int, target_index: int) -> int:
+        if self.block is not None:
+            self.block.wait(1)
+        self.committed.append((table_index, rows))
+        if self.operations is not None:
+            self.operations.append(("update", table_index, target_index))
         return rows
 
     def close(self) -> None:
@@ -83,6 +103,81 @@ class _FatalAfterCommitWorker(_Worker):
 
 
 class TrafficLaneTests(unittest.TestCase):
+    def test_schedules_a_deterministic_fifty_fifty_insert_update_mix(self) -> None:
+        committed: list[tuple[int, int]] = []
+        operations: list[tuple[str, int, int | None]] = []
+        target = TrafficTarget(200, 1, 1, 100, update_percent=50)
+        lane = TrafficLane.start(
+            lambda: _Worker(committed, operations=operations),
+            lambda: target,
+            table_count=1,
+        )
+        deadline = time.monotonic() + 1
+        while len(operations) < 10 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        snapshot = lane.stop_and_join(1)
+
+        self.assertEqual(
+            operations[:10],
+            [
+                ("insert", 0, None),
+                ("update", 0, 0),
+                ("insert", 0, None),
+                ("update", 0, 1),
+                ("insert", 0, None),
+                ("update", 0, 2),
+                ("insert", 0, None),
+                ("update", 0, 3),
+                ("insert", 0, None),
+                ("update", 0, 4),
+            ],
+        )
+        self.assertGreaterEqual(snapshot.committed_insert_transactions, 5)
+        self.assertGreaterEqual(snapshot.committed_update_transactions, 5)
+
+    def test_update_targets_rotate_independently_for_each_table(self) -> None:
+        committed: list[tuple[int, int]] = []
+        operations: list[tuple[str, int, int | None]] = []
+        target = TrafficTarget(500, 1, 1, 100, update_percent=100)
+        lane = TrafficLane.start(
+            lambda: _Worker(committed, operations=operations),
+            lambda: target,
+            table_count=2,
+        )
+        deadline = time.monotonic() + 1
+        while len(operations) < 6 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        lane.stop_and_join(1)
+
+        self.assertEqual(
+            operations[:6],
+            [
+                ("update", 0, 0),
+                ("update", 1, 0),
+                ("update", 0, 1),
+                ("update", 1, 1),
+                ("update", 0, 2),
+                ("update", 1, 2),
+            ],
+        )
+
+    def test_default_target_remains_insert_only(self) -> None:
+        committed: list[tuple[int, int]] = []
+        operations: list[tuple[str, int, int | None]] = []
+        target = TrafficTarget(200, 1, 1, 100)
+        lane = TrafficLane.start(
+            lambda: _Worker(committed, operations=operations),
+            lambda: target,
+            table_count=1,
+        )
+        deadline = time.monotonic() + 1
+        while len(operations) < 5 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        snapshot = lane.stop_and_join(1)
+
+        self.assertTrue(all(kind == "insert" for kind, _, _ in operations))
+        self.assertEqual(snapshot.committed_update_transactions, 0)
+
     def test_api_batch_must_fit_in_configured_queue(self) -> None:
         target = TrafficTarget(100, 1, 1, 4)
         with self.assertRaisesRegex(ValueError, "batch must fit"):

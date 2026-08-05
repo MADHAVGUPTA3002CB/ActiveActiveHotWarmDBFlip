@@ -52,6 +52,62 @@ class HotWriteGateStatus:
     version: int
 
 
+@dataclass(frozen=True, slots=True)
+class UpdateTarget:
+    id: uuid.UUID
+    created_at: datetime
+
+
+def _validate_update_target_pools(
+    manifest: BenchmarkManifest,
+    pools: tuple[tuple[UpdateTarget, ...], ...],
+) -> None:
+    if pools and len(pools) != len(manifest.tables):
+        raise ValueError("update target pools must match the benchmark table count")
+    if any(not targets for targets in pools):
+        raise ValueError("every update target pool must contain at least one row")
+
+
+def _update_event_payload(
+    pools: tuple[tuple[UpdateTarget, ...], ...],
+    table_index: int,
+    rows: int,
+    target_index: int,
+    base_payload: dict[str, object],
+    sequence_prefix: int,
+    sequence: int,
+) -> tuple[list[dict[str, object]], int]:
+    if not pools:
+        raise RuntimeError("UPDATE traffic has no seeded target pool")
+    if (
+        not isinstance(target_index, int)
+        or isinstance(target_index, bool)
+        or target_index < 0
+    ):
+        raise ValueError("target_index must be a non-negative integer")
+    if not isinstance(rows, int) or isinstance(rows, bool) or not 1 <= rows <= 100_000:
+        raise ValueError("rows must be an integer between 1 and 100000")
+    targets = pools[table_index]
+    start = target_index * rows
+    selected = tuple(targets[(start + offset) % len(targets)] for offset in range(rows))
+    if len({(target.id, target.created_at) for target in selected}) != rows:
+        raise RuntimeError(
+            "UPDATE transaction needs at least rows_per_transaction seeded rows"
+        )
+    payload = [
+        {
+            "id": str(target.id),
+            "created_at": target.created_at.isoformat(),
+            "payload": {
+                **base_payload,
+                "update_sequence_no": sequence_prefix + sequence + offset,
+            },
+        }
+        for offset, target in enumerate(selected)
+    ]
+    return payload, sequence + rows
+
+
 def hot_write_gate_status(
     connection: psycopg.Connection,
     cell: str,
@@ -648,6 +704,11 @@ def _ensure_connector_roles(
     )
     hot.execute(
         sql.SQL(
+            "GRANT EXECUTE ON FUNCTION flipbench_guard.update_events(text, text, bigint, name, jsonb) TO {}"
+        ).format(sql.Identifier(writer_role))
+    )
+    hot.execute(
+        sql.SQL(
             "GRANT EXECUTE ON FUNCTION flipbench_guard.admit_optimistic_batch(text, text, bigint) TO {}"
         ).format(sql.Identifier(writer_role))
     )
@@ -662,7 +723,12 @@ def _ensure_connector_roles(
         ).format(sql.Identifier(writer_role))
     )
     hot.execute(
-        sql.SQL("GRANT INSERT ON TABLE {} TO flipbench_guard_owner").format(
+        sql.SQL(
+            "GRANT EXECUTE ON FUNCTION flipbench_guard.update_events_optimistic(text, text, name, jsonb) TO {}"
+        ).format(sql.Identifier(writer_role))
+    )
+    hot.execute(
+        sql.SQL("GRANT INSERT, SELECT, UPDATE ON TABLE {} TO flipbench_guard_owner").format(
             sql.SQL(", ").join(sql.Identifier(route.parent) for route in manifest.tables)
         )
     )
@@ -1040,6 +1106,67 @@ def _insert_events_unchecked(
     return inserted
 
 
+def seed_update_targets(
+    hot_dsn: str,
+    manifest: BenchmarkManifest,
+    run_id: uuid.UUID,
+    rows_per_table: int,
+    timeslot: str,
+    payload_bytes: int,
+) -> tuple[tuple[UpdateTarget, ...], ...]:
+    """Insert an unmeasured row pool used by deterministic UPDATE traffic."""
+    if (
+        not isinstance(rows_per_table, int)
+        or isinstance(rows_per_table, bool)
+        or not 1 <= rows_per_table <= 100_000
+    ):
+        raise ValueError("rows_per_table must be an integer between 1 and 100000")
+    if not 16 <= payload_bytes <= 1_048_576:
+        raise ValueError("payload_bytes must be 16..1,048,576")
+    validated_timeslot = validate_timeslot(timeslot)
+    created_at = RETIRING_START if validated_timeslot == "retiring" else ACTIVE_START
+    payload = Jsonb(
+        {
+            "padding": "x" * (payload_bytes - 15),
+            "timeslot": validated_timeslot,
+            "seed": True,
+        }
+    )
+    pools: list[tuple[UpdateTarget, ...]] = []
+    sequence_prefix = (uuid.uuid4().int % 1_000_000) * 1_000_000_000_000
+    with connect(hot_dsn) as connection:
+        with connection.cursor() as cursor:
+            for table_index, route in enumerate(manifest.tables):
+                targets = tuple(
+                    UpdateTarget(uuid.uuid4(), created_at)
+                    for _ in range(rows_per_table)
+                )
+                for batch_start in range(0, rows_per_table, 1_000):
+                    batch = targets[batch_start : batch_start + 1_000]
+                    cursor.executemany(
+                        sql.SQL(
+                            "INSERT INTO {} "
+                            "(id, experiment_run_id, sequence_no, created_at, payload) "
+                            "VALUES (%s, %s, %s, %s, %s)"
+                        ).format(sql.Identifier(route.parent)),
+                        tuple(
+                            (
+                                target.id,
+                                run_id,
+                                sequence_prefix
+                                + table_index * rows_per_table
+                                + batch_start
+                                + offset,
+                                target.created_at,
+                                payload,
+                            )
+                            for offset, target in enumerate(batch)
+                        ),
+                    )
+                pools.append(targets)
+    return tuple(pools)
+
+
 def guarded_insert_events(
     hot_dsn: str,
     warm_dsn: str,
@@ -1083,6 +1210,7 @@ class GuardedTransactionSession:
         run_id: uuid.UUID,
         timeslot: str,
         payload_bytes: int,
+        update_targets_by_table: tuple[tuple[UpdateTarget, ...], ...] = (),
     ) -> None:
         if not 16 <= payload_bytes <= 1_048_576:
             raise ValueError("payload_bytes must be 16..1,048,576")
@@ -1090,9 +1218,13 @@ class GuardedTransactionSession:
         self._run_id = run_id
         self._timeslot = validate_timeslot(timeslot)
         self._created_at = RETIRING_START if self._timeslot == "retiring" else ACTIVE_START
-        self._payload = psycopg.types.json.Jsonb(
-            {"padding": "x" * (payload_bytes - 15), "timeslot": self._timeslot}
-        )
+        self._payload_value: dict[str, object] = {
+            "padding": "x" * (payload_bytes - 15),
+            "timeslot": self._timeslot,
+        }
+        self._payload = psycopg.types.json.Jsonb(self._payload_value)
+        _validate_update_target_pools(manifest, update_targets_by_table)
+        self._update_targets_by_table = update_targets_by_table
         self._lock_name = lifecycle_lock_name(manifest.cell, self._timeslot)
         self._sequence_prefix = (uuid.uuid4().int % 1_000_000) * 1_000_000_000_000
         self._sequence = 0
@@ -1201,6 +1333,59 @@ class GuardedTransactionSession:
             raise CommittedTrafficWorkerError(len(event_rows), str(error)) from error
         return len(event_rows)
 
+    def update(self, table_index: int, rows: int, target_index: int) -> int:
+        if self._closed:
+            raise RuntimeError("transaction session is closed")
+        if (
+            not isinstance(table_index, int)
+            or isinstance(table_index, bool)
+            or not 0 <= table_index < len(self._manifest.tables)
+        ):
+            raise ValueError("table_index is outside the benchmark manifest")
+        payload, self._sequence = _update_event_payload(
+            self._update_targets_by_table,
+            table_index,
+            rows,
+            target_index,
+            self._payload_value,
+            self._sequence_prefix,
+            self._sequence,
+        )
+        update_rows = tuple(
+            (
+                Jsonb(item["payload"]),
+                uuid.UUID(str(item["id"])),
+                datetime.fromisoformat(str(item["created_at"])),
+            )
+            for item in payload
+        )
+        self._acquire_guard()
+        try:
+            with self._hot.cursor() as cursor:
+                cursor.executemany(
+                    sql.SQL(
+                        "UPDATE {} SET payload=%s, updated_at=clock_timestamp() "
+                        "WHERE id=%s AND created_at=%s"
+                    ).format(sql.Identifier(self._manifest.tables[table_index].parent)),
+                    update_rows,
+                )
+                if cursor.rowcount != rows:
+                    raise RuntimeError(
+                        "hot writer parked: guarded UPDATE target is no longer attached"
+                    )
+            self._hot.commit()
+        except BaseException:
+            try:
+                self._hot.rollback()
+            finally:
+                self._release_guard()
+            raise
+        try:
+            self._release_guard()
+        except FatalTrafficWorkerError as error:
+            raise CommittedTrafficWorkerError(rows, str(error)) from error
+        return rows
+
     def close(self) -> None:
         if self._closed:
             return
@@ -1226,6 +1411,7 @@ class HotFencedTransactionSession:
         timeslot: str,
         payload_bytes: int,
         expected_ownership_epoch: int,
+        update_targets_by_table: tuple[tuple[UpdateTarget, ...], ...] = (),
     ) -> None:
         if not 16 <= payload_bytes <= 1_048_576:
             raise ValueError("payload_bytes must be 16..1,048,576")
@@ -1244,6 +1430,8 @@ class HotFencedTransactionSession:
             "timeslot": self._timeslot,
         }
         self._expected_ownership_epoch = expected_ownership_epoch
+        _validate_update_target_pools(manifest, update_targets_by_table)
+        self._update_targets_by_table = update_targets_by_table
         self._sequence_prefix = (uuid.uuid4().int % 1_000_000) * 1_000_000_000_000
         self._sequence = 0
         self._closed = False
@@ -1302,6 +1490,51 @@ class HotFencedTransactionSession:
             raise
         return rows
 
+    def update(self, table_index: int, rows: int, target_index: int) -> int:
+        if self._closed:
+            raise RuntimeError("transaction session is closed")
+        if (
+            not isinstance(table_index, int)
+            or isinstance(table_index, bool)
+            or not 0 <= table_index < len(self._manifest.tables)
+        ):
+            raise ValueError("table_index is outside the benchmark manifest")
+        payload, self._sequence = _update_event_payload(
+            self._update_targets_by_table,
+            table_index,
+            rows,
+            target_index,
+            self._payload,
+            self._sequence_prefix,
+            self._sequence,
+        )
+        try:
+            result = self._hot.execute(
+                """
+                /* guarded hot UPDATE transaction */
+                SELECT flipbench_guard.update_events(%s, %s, %s, %s, %s)::integer
+                """,
+                (
+                    self._manifest.cell,
+                    self._timeslot,
+                    self._expected_ownership_epoch,
+                    self._manifest.tables[table_index].parent,
+                    Jsonb(payload),
+                ),
+            ).fetchone()
+            if result is None or result[0] != rows:
+                raise RuntimeError(
+                    "guarded database UPDATE affected "
+                    f"{None if result is None else result[0]} rows; expected {rows}"
+                )
+            self._hot.commit()
+        except Exception as error:
+            self._hot.rollback()
+            if "hot writer parked:" in str(error):
+                raise RuntimeError(str(error)) from error
+            raise
+        return rows
+
     def close(self) -> None:
         if self._closed:
             return
@@ -1324,6 +1557,7 @@ class OptimisticDetachTransactionSession:
         admission_check_mode: OptimisticAdmissionCheckMode | str = (
             OptimisticAdmissionCheckMode.STATE_AND_EPOCH
         ),
+        update_targets_by_table: tuple[tuple[UpdateTarget, ...], ...] = (),
     ) -> None:
         if not 16 <= payload_bytes <= 1_048_576:
             raise ValueError("payload_bytes must be 16..1,048,576")
@@ -1360,6 +1594,8 @@ class OptimisticDetachTransactionSession:
         }
         self._expected_ownership_epoch = expected_ownership_epoch
         self._admission_check_mode = selected_admission_check
+        _validate_update_target_pools(manifest, update_targets_by_table)
+        self._update_targets_by_table = update_targets_by_table
         self._operations_per_batch = operations_per_batch
         self._remaining_batch_operations = 0
         self._sequence_prefix = (uuid.uuid4().int % 1_000_000) * 1_000_000_000_000
@@ -1385,6 +1621,17 @@ class OptimisticDetachTransactionSession:
         ]
 
     def write(self, table_index: int, rows: int) -> int:
+        return self._execute_operation(table_index, rows, None)
+
+    def update(self, table_index: int, rows: int, target_index: int) -> int:
+        return self._execute_operation(table_index, rows, target_index)
+
+    def _execute_operation(
+        self,
+        table_index: int,
+        rows: int,
+        update_target_index: int | None,
+    ) -> int:
         if self._closed:
             raise RuntimeError("transaction session is closed")
         if (
@@ -1393,7 +1640,20 @@ class OptimisticDetachTransactionSession:
             or not 0 <= table_index < len(self._manifest.tables)
         ):
             raise ValueError("table_index is outside the benchmark manifest")
-        payload = self._event_payload(rows)
+        if update_target_index is None:
+            payload = self._event_payload(rows)
+            function_name = "insert_events_optimistic"
+        else:
+            payload, self._sequence = _update_event_payload(
+                self._update_targets_by_table,
+                table_index,
+                rows,
+                update_target_index,
+                self._payload,
+                self._sequence_prefix,
+                self._sequence,
+            )
+            function_name = "update_events_optimistic"
         starts_batch = self._remaining_batch_operations == 0
         if (
             starts_batch
@@ -1404,9 +1664,9 @@ class OptimisticDetachTransactionSession:
                 WITH admission AS MATERIALIZED (
                     SELECT flipbench_guard.admit_optimistic_batch(%s, %s, %s)::bigint
                 )
-                SELECT flipbench_guard.insert_events_optimistic(%s, %s, %s, %s)::integer
+                SELECT flipbench_guard.{function_name}(%s, %s, %s, %s)::integer
                 FROM admission
-                """
+                """.format(function_name=function_name)
             parameters = (
                 self._manifest.cell,
                 self._timeslot,
@@ -1421,9 +1681,9 @@ class OptimisticDetachTransactionSession:
                 WITH admission AS MATERIALIZED (
                     SELECT flipbench_guard.admit_optimistic_batch_state_only(%s, %s)::boolean
                 )
-                SELECT flipbench_guard.insert_events_optimistic(%s, %s, %s, %s)::integer
+                SELECT flipbench_guard.{function_name}(%s, %s, %s, %s)::integer
                 FROM admission
-                """
+                """.format(function_name=function_name)
             parameters = (
                 self._manifest.cell,
                 self._timeslot,
@@ -1434,8 +1694,8 @@ class OptimisticDetachTransactionSession:
             )
         else:
             statement = """
-                SELECT flipbench_guard.insert_events_optimistic(%s, %s, %s, %s)::integer
-                """
+                SELECT flipbench_guard.{function_name}(%s, %s, %s, %s)::integer
+                """.format(function_name=function_name)
             parameters = (
                 self._manifest.cell,
                 self._timeslot,
@@ -1446,7 +1706,7 @@ class OptimisticDetachTransactionSession:
             result = self._hot.execute(statement, parameters).fetchone()
             if result is None or result[0] != rows:
                 raise RuntimeError(
-                    "optimistic database operation inserted "
+                    "optimistic database operation affected "
                     f"{None if result is None else result[0]} rows; expected {rows}"
                 )
             self._hot.commit()

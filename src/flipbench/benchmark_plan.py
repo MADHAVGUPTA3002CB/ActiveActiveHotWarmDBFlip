@@ -44,6 +44,24 @@ def _exact_fields(label: str, value: object, expected: set[str]) -> Mapping[str,
     return value
 
 
+def _required_and_optional_fields(
+    label: str,
+    value: object,
+    required: set[str],
+    optional: set[str],
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise BenchmarkPlanError(f"{label} must be an object")
+    missing = required - set(value)
+    unknown = set(value) - required - optional
+    if missing or unknown:
+        raise BenchmarkPlanError(
+            f"{label} must contain required fields {sorted(required)} "
+            f"and only optional fields {sorted(optional)}"
+        )
+    return value
+
+
 def _integer(label: str, value: object, minimum: int, maximum: int) -> int:
     if (
         not isinstance(value, int)
@@ -65,6 +83,9 @@ class BenchmarkWorkload:
     queue_limit_per_lane: int
     rate_window_seconds: int
     minimum_achievement_percent: int
+    active_update_percent: int = 0
+    retiring_update_percent: int = 0
+    update_seed_rows_per_table: int = 1_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,7 +238,7 @@ def load_benchmark_plan(path: Path) -> BenchmarkPlan:
     if any(target * active_percent // 100 < 1 for target in targets):
         raise BenchmarkPlanError("active_percent leaves an empty active lane")
 
-    workload_raw = _exact_fields(
+    workload_raw = _required_and_optional_fields(
         "workload",
         root["workload"],
         {
@@ -228,6 +249,11 @@ def load_benchmark_plan(path: Path) -> BenchmarkPlan:
             "queue_limit_per_lane",
             "rate_window_seconds",
             "minimum_achievement_percent",
+        },
+        {
+            "active_update_percent",
+            "retiring_update_percent",
+            "update_seed_rows_per_table",
         },
     )
     workload = BenchmarkWorkload(
@@ -243,9 +269,34 @@ def load_benchmark_plan(path: Path) -> BenchmarkPlan:
             1,
             100,
         ),
+        _integer(
+            "active_update_percent",
+            workload_raw.get("active_update_percent", 0),
+            0,
+            100,
+        ),
+        _integer(
+            "retiring_update_percent",
+            workload_raw.get("retiring_update_percent", 0),
+            0,
+            100,
+        ),
+        _integer(
+            "update_seed_rows_per_table",
+            workload_raw.get("update_seed_rows_per_table", 1_000),
+            1,
+            100_000,
+        ),
     )
     if workload.active_workers + workload.retiring_workers > 64:
         raise BenchmarkPlanError("active and retiring workers must total at most 64")
+    if (
+        workload.active_update_percent > 0
+        or workload.retiring_update_percent > 0
+    ) and workload.update_seed_rows_per_table < workload.rows_per_transaction:
+        raise BenchmarkPlanError(
+            "update_seed_rows_per_table must cover rows_per_transaction"
+        )
 
     timing_raw = _exact_fields(
         "timing",

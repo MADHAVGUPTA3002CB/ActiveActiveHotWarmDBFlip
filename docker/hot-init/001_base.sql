@@ -298,3 +298,138 @@ $$;
 ALTER FUNCTION flipbench_guard.insert_events_optimistic(text, text, name, jsonb)
 OWNER TO flipbench_guard_owner;
 REVOKE ALL ON FUNCTION flipbench_guard.insert_events_optimistic(text, text, name, jsonb) FROM PUBLIC;
+
+DROP FUNCTION IF EXISTS flipbench_guard.update_events_optimistic(text, text, name, jsonb);
+
+CREATE OR REPLACE FUNCTION flipbench_guard.update_events_optimistic(
+    p_cell text,
+    p_timeslot text,
+    p_parent_name name,
+    p_rows jsonb
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    updated_count integer;
+    expected_count integer;
+BEGIN
+    IF p_timeslot NOT IN ('active', 'retiring') THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'unknown optimistic update timeslot';
+    END IF;
+    IF jsonb_typeof(p_rows) <> 'array'
+       OR jsonb_array_length(p_rows) < 1
+       OR jsonb_array_length(p_rows) > 100000 THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'optimistic update batch must contain 1..100000 rows';
+    END IF;
+    IF pg_column_size(p_rows) > 67108864 THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'optimistic update payload exceeds the 64 MiB safety limit';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM flipbench_guard.write_routes AS route
+        WHERE route.cell = p_cell
+          AND route.timeslot = p_timeslot
+          AND route.parent_name = p_parent_name
+    ) THEN
+        RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'optimistic update route is not authorized';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(p_rows) AS row_item
+        WHERE row_item->>'id' IS NULL
+           OR row_item->>'created_at' IS NULL
+           OR row_item->'payload' IS NULL
+           OR CASE p_timeslot
+                WHEN 'retiring' THEN
+                    (row_item->>'created_at')::timestamptz < timestamptz '2026-07-31 12:00:00+00'
+                    OR (row_item->>'created_at')::timestamptz >= timestamptz '2026-08-01 00:00:00+00'
+                WHEN 'active' THEN
+                    (row_item->>'created_at')::timestamptz < timestamptz '2026-08-01 00:00:00+00'
+                    OR (row_item->>'created_at')::timestamptz >= timestamptz '2026-08-01 12:00:00+00'
+                ELSE true
+              END
+    ) THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'optimistic update row is invalid or outside the selected timeslot';
+    END IF;
+
+    expected_count := jsonb_array_length(p_rows);
+    BEGIN
+        EXECUTE format(
+            'WITH input_rows AS ('
+            '  SELECT (item->>''id'')::uuid AS id, '
+            '         (item->>''created_at'')::timestamptz AS created_at, '
+            '         item->''payload'' AS payload '
+            '  FROM jsonb_array_elements($1) AS item'
+            ') '
+            'UPDATE public.%I AS target '
+            'SET payload = input_rows.payload, updated_at = clock_timestamp() '
+            'FROM input_rows '
+            'WHERE target.id = input_rows.id '
+            '  AND target.created_at = input_rows.created_at',
+            p_parent_name
+        ) USING p_rows;
+        GET DIAGNOSTICS updated_count = ROW_COUNT;
+    EXCEPTION
+        WHEN check_violation OR lock_not_available OR query_canceled THEN
+            RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'hot writer parked: optimistic detach race aborted one update operation';
+    END;
+    IF updated_count <> expected_count THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'hot writer parked: optimistic update target is no longer attached';
+    END IF;
+    RETURN updated_count;
+END;
+$$;
+
+ALTER FUNCTION flipbench_guard.update_events_optimistic(text, text, name, jsonb)
+OWNER TO flipbench_guard_owner;
+REVOKE ALL ON FUNCTION flipbench_guard.update_events_optimistic(text, text, name, jsonb) FROM PUBLIC;
+
+DROP FUNCTION IF EXISTS flipbench_guard.update_events(text, text, bigint, name, jsonb);
+
+CREATE OR REPLACE FUNCTION flipbench_guard.update_events(
+    p_cell text,
+    p_timeslot text,
+    p_expected_ownership_epoch bigint,
+    p_parent_name name,
+    p_rows jsonb
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    gate_state text;
+    gate_epoch bigint;
+BEGIN
+    IF p_timeslot NOT IN ('active', 'retiring') THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'unknown guarded update timeslot';
+    END IF;
+
+    SELECT gate.state, gate.ownership_epoch
+    INTO gate_state, gate_epoch
+    FROM flipbench_guard.partition_write_gates AS gate
+    WHERE gate.cell = p_cell AND gate.timeslot = p_timeslot
+    FOR SHARE;
+
+    IF NOT FOUND
+       OR gate_state <> 'open'
+       OR gate_epoch <> p_expected_ownership_epoch THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'hot writer parked: ownership gate is not open for the expected epoch';
+    END IF;
+
+    RETURN flipbench_guard.update_events_optimistic(
+        p_cell,
+        p_timeslot,
+        p_parent_name,
+        p_rows
+    );
+END;
+$$;
+
+ALTER FUNCTION flipbench_guard.update_events(text, text, bigint, name, jsonb)
+OWNER TO flipbench_guard_owner;
+REVOKE ALL ON FUNCTION flipbench_guard.update_events(text, text, bigint, name, jsonb) FROM PUBLIC;
