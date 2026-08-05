@@ -10,7 +10,14 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from .core import BenchmarkManifest, HotSourceIdentity, LeafFenceMarker, TableRoute, TopicPartition
+from .core import (
+    BenchmarkManifest,
+    HotSourceIdentity,
+    LeafFenceMarker,
+    OptimisticAdmissionCheckMode,
+    TableRoute,
+    TopicPartition,
+)
 from .connector_configs import FENCE_RECEIPT_TABLE, FENCE_SCHEMA, SourceConnectorSpec
 from .lifecycle import lifecycle_lock_name, validate_timeslot
 from .traffic import CommittedTrafficWorkerError, FatalTrafficWorkerError
@@ -642,6 +649,11 @@ def _ensure_connector_roles(
     hot.execute(
         sql.SQL(
             "GRANT EXECUTE ON FUNCTION flipbench_guard.admit_optimistic_batch(text, text, bigint) TO {}"
+        ).format(sql.Identifier(writer_role))
+    )
+    hot.execute(
+        sql.SQL(
+            "GRANT EXECUTE ON FUNCTION flipbench_guard.admit_optimistic_batch_state_only(text, text) TO {}"
         ).format(sql.Identifier(writer_role))
     )
     hot.execute(
@@ -1307,17 +1319,31 @@ class OptimisticDetachTransactionSession:
         run_id: uuid.UUID,
         timeslot: str,
         payload_bytes: int,
-        expected_ownership_epoch: int,
+        expected_ownership_epoch: int | None,
         operations_per_batch: int,
+        admission_check_mode: OptimisticAdmissionCheckMode | str = (
+            OptimisticAdmissionCheckMode.STATE_AND_EPOCH
+        ),
     ) -> None:
         if not 16 <= payload_bytes <= 1_048_576:
             raise ValueError("payload_bytes must be 16..1,048,576")
-        if (
-            not isinstance(expected_ownership_epoch, int)
-            or isinstance(expected_ownership_epoch, bool)
-            or expected_ownership_epoch <= 0
-        ):
-            raise ValueError("expected_ownership_epoch must be a positive integer")
+        try:
+            selected_admission_check = OptimisticAdmissionCheckMode(
+                admission_check_mode
+            )
+        except ValueError as error:
+            raise ValueError("unknown optimistic admission check mode") from error
+        if selected_admission_check is OptimisticAdmissionCheckMode.STATE_AND_EPOCH:
+            if (
+                not isinstance(expected_ownership_epoch, int)
+                or isinstance(expected_ownership_epoch, bool)
+                or expected_ownership_epoch <= 0
+            ):
+                raise ValueError(
+                    "state-and-epoch admission requires a positive ownership epoch"
+                )
+        elif expected_ownership_epoch is not None:
+            raise ValueError("state-only admission must not receive an ownership epoch")
         if (
             not isinstance(operations_per_batch, int)
             or isinstance(operations_per_batch, bool)
@@ -1333,6 +1359,7 @@ class OptimisticDetachTransactionSession:
             "timeslot": self._timeslot,
         }
         self._expected_ownership_epoch = expected_ownership_epoch
+        self._admission_check_mode = selected_admission_check
         self._operations_per_batch = operations_per_batch
         self._remaining_batch_operations = 0
         self._sequence_prefix = (uuid.uuid4().int % 1_000_000) * 1_000_000_000_000
@@ -1368,7 +1395,11 @@ class OptimisticDetachTransactionSession:
             raise ValueError("table_index is outside the benchmark manifest")
         payload = self._event_payload(rows)
         starts_batch = self._remaining_batch_operations == 0
-        if starts_batch:
+        if (
+            starts_batch
+            and self._admission_check_mode
+            is OptimisticAdmissionCheckMode.STATE_AND_EPOCH
+        ):
             statement = """
                 WITH admission AS MATERIALIZED (
                     SELECT flipbench_guard.admit_optimistic_batch(%s, %s, %s)::bigint
@@ -1380,6 +1411,22 @@ class OptimisticDetachTransactionSession:
                 self._manifest.cell,
                 self._timeslot,
                 self._expected_ownership_epoch,
+                self._manifest.cell,
+                self._timeslot,
+                self._manifest.tables[table_index].parent,
+                Jsonb(payload),
+            )
+        elif starts_batch:
+            statement = """
+                WITH admission AS MATERIALIZED (
+                    SELECT flipbench_guard.admit_optimistic_batch_state_only(%s, %s)::boolean
+                )
+                SELECT flipbench_guard.insert_events_optimistic(%s, %s, %s, %s)::integer
+                FROM admission
+                """
+            parameters = (
+                self._manifest.cell,
+                self._timeslot,
                 self._manifest.cell,
                 self._timeslot,
                 self._manifest.tables[table_index].parent,

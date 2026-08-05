@@ -11,7 +11,7 @@ Every variant moves the same retiring timeslot and must reach the same final inv
 | E | Isolated | One optimistic gate admission per API batch | LSN + sink offsets | Concurrent |
 | F | Isolated | E foreground path | Exact per-leaf Kafka marker + warm receipt | Concurrent |
 | G | Isolated | E foreground path | Exact per-leaf marker + receipt | Atomic detach-marker, serial |
-| H | Isolated | E foreground path | Exact per-leaf marker + receipt | Atomic detach-marker, parallel |
+| H | Isolated | State-only admission once per API batch | Exact per-leaf marker + receipt | Atomic detach-marker, parallel |
 
 ## A — Shared CDC baseline
 
@@ -56,6 +56,8 @@ G strengthens F's ordering by running `DETACH PARTITION` and that leaf's marker 
 It processes leaves serially. Non-concurrent detach needs a stronger parent-table lock and may briefly block active operations on that parent. More retiring tables increase the serial detach wall time.
 
 ## H — Parallel atomic detach and marker
+
+H checks only that the hot gate is `open` on the first operation of each API-style batch; the application sends no ownership epoch. Later operations remain separate commits and rely on detach failure plus application retry/error handling for the accepted race. The flip coordinator still uses the ownership epoch to park and recover the gate safely.
 
 H runs G's exact per-leaf transaction concurrently, using one PostgreSQL connection and transaction per retiring leaf. Independent parent tables can detach in parallel, reducing the all-leaf detach wall time.
 

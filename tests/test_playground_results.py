@@ -125,6 +125,10 @@ class PlaygroundResultHistoryTests(unittest.TestCase):
             summary["source_proof_mode"],
             "parallel_atomic_detach_marker_v1",
         )
+        self.assertEqual(
+            summary["optimistic_admission_check_mode"], "state_only_v1"
+        )
+        self.assertEqual(summary["ownership_epoch_checks_per_api_batch"], 0)
         self.assertEqual(summary["parallel_detach_wall_ns"], 5)
 
     def test_labels_previous_per_transaction_gate_e_as_superseded(self) -> None:

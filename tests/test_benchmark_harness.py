@@ -98,6 +98,12 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 "source_proof_mode": "parallel_atomic_detach_marker_v1",
             },
         )
+        self.assertEqual(
+            HARNESS._workload_payload(plan, case)[
+                "optimistic_admission_check_mode"
+            ],
+            "state_only_v1",
+        )
 
     def test_saved_outputs_bind_plan_hash_for_matched_shapes(self) -> None:
         plan = quick_plan()

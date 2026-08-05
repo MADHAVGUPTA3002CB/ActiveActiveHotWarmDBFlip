@@ -25,6 +25,7 @@ from .core import (
     HotSourceIdentity,
     LeafFenceMarker,
     OffsetVector,
+    OptimisticAdmissionCheckMode,
     SourceProofMode,
     TimingError,
     TopicPartition,
@@ -139,6 +140,15 @@ class FlipRunner:
             )
         except ValueError as error:
             raise ValueError("unknown write_fence_mode") from error
+        try:
+            self.optimistic_admission_check_mode = OptimisticAdmissionCheckMode(
+                self.scenario_metadata.get(
+                    "optimistic_admission_check_mode",
+                    OptimisticAdmissionCheckMode.STATE_AND_EPOCH.value,
+                )
+            )
+        except ValueError as error:
+            raise ValueError("unknown optimistic admission check mode") from error
         admitted_gate_epoch = self.scenario_metadata.get("retiring_write_gate_epoch")
         if self.write_fence_mode in (
             WriteFenceMode.HOT_TRANSACTIONAL,
@@ -169,6 +179,22 @@ class FlipRunner:
         ):
             raise ValueError(
                 "marker source proof requires isolated sources, optimistic detach, and passive heartbeat mode"
+            )
+        if (
+            selected_proof_mode
+            is SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER
+            and self.optimistic_admission_check_mode
+            is not OptimisticAdmissionCheckMode.STATE_ONLY
+        ):
+            raise ValueError("Variant H requires state-only API batch admission")
+        if (
+            selected_proof_mode
+            is not SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER
+            and self.optimistic_admission_check_mode
+            is OptimisticAdmissionCheckMode.STATE_ONLY
+        ):
+            raise ValueError(
+                "state-only API batch admission is reserved for Variant H"
             )
 
     @staticmethod

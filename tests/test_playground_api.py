@@ -97,6 +97,27 @@ class PlaygroundMaintenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "restart writes"):
             runtime.update_workload({"active_workers": 40})
 
+    def test_live_workload_cannot_change_its_admission_contract(self) -> None:
+        from flipbench.playground import WorkloadSettings
+
+        runtime = self.runtime()
+        runtime.settings = SimpleNamespace(table_count=5)
+        runtime._lock = Lock()
+        runtime._admission_generation = 0
+        runtime._admission = Mock()
+        current = WorkloadSettings(
+            mode="target_rate_v1",
+            write_fence_mode="optimistic_detach_v1",
+            optimistic_admission_check_mode="state_and_epoch_v1",
+        )
+        runtime.workload.settings.return_value = current
+        runtime.workload.running.return_value = True
+
+        with self.assertRaisesRegex(RuntimeError, "restart writes"):
+            runtime.update_workload(
+                {"optimistic_admission_check_mode": "state_only_v1"}
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

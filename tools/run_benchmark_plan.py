@@ -102,6 +102,9 @@ def _workload_payload(plan: BenchmarkPlan, case: BenchmarkCase) -> dict[str, Any
     return {
         "mode": "target_rate_v1",
         "write_fence_mode": case.write_fence_mode,
+        "optimistic_admission_check_mode": (
+            case.optimistic_admission_check_mode
+        ),
         "active_target_tps": case.active_target_tps,
         "retiring_target_tps": case.retiring_target_tps,
         "active_rows_per_transaction": plan.workload.rows_per_transaction,
@@ -292,6 +295,12 @@ def _copy_verified_result(
             "ownership_reads_per_api_batch": scenario.get(
                 "ownership_reads_per_api_batch"
             ),
+            "ownership_epoch_checks_per_api_batch": scenario.get(
+                "ownership_epoch_checks_per_api_batch"
+            ),
+            "optimistic_admission_check_mode": scenario.get(
+                "optimistic_admission_check_mode"
+            ),
             "postgres_transactions_per_api_batch": scenario.get(
                 "postgres_transactions_per_api_batch"
             ),
@@ -307,6 +316,12 @@ def _copy_verified_result(
             "tables_per_api_transaction": case.tables_per_api_transaction,
             "operations_per_api_batch": case.operations_per_api_batch,
             "ownership_reads_per_api_batch": case.ownership_reads_per_api_batch,
+            "ownership_epoch_checks_per_api_batch": (
+                case.ownership_epoch_checks_per_api_batch
+            ),
+            "optimistic_admission_check_mode": (
+                case.optimistic_admission_check_mode
+            ),
             "postgres_transactions_per_api_batch": case.operations_per_api_batch,
             "api_batch_scheduling": "single_worker_reserved_v1",
         },
@@ -404,6 +419,12 @@ def run_case(
         "tables_per_api_transaction": case.tables_per_api_transaction,
         "operations_per_api_batch": case.operations_per_api_batch,
         "ownership_reads_per_api_batch": case.ownership_reads_per_api_batch,
+        "ownership_epoch_checks_per_api_batch": (
+            case.ownership_epoch_checks_per_api_batch
+        ),
+        "optimistic_admission_check_mode": (
+            case.optimistic_admission_check_mode
+        ),
         "postgres_transactions_per_api_batch": case.operations_per_api_batch,
         "estimated_physical_rows_per_api_transaction": (
             plan.workload.rows_per_transaction * case.tables_per_api_transaction
@@ -477,6 +498,8 @@ def _print_plan(plan: BenchmarkPlan) -> None:
                         "tables_per_api_transaction": case.tables_per_api_transaction,
                         "operations_per_api_batch": case.operations_per_api_batch,
                         "ownership_reads_per_api_batch": case.ownership_reads_per_api_batch,
+                        "ownership_epoch_checks_per_api_batch": case.ownership_epoch_checks_per_api_batch,
+                        "optimistic_admission_check_mode": case.optimistic_admission_check_mode,
                         "postgres_transactions_per_api_batch": case.operations_per_api_batch,
                     }
                     for case in build_benchmark_cases(plan)
@@ -531,6 +554,8 @@ def main() -> None:
                     "tables_per_api_transaction": case.tables_per_api_transaction,
                     "operations_per_api_batch": case.operations_per_api_batch,
                     "ownership_reads_per_api_batch": case.ownership_reads_per_api_batch,
+                    "ownership_epoch_checks_per_api_batch": case.ownership_epoch_checks_per_api_batch,
+                    "optimistic_admission_check_mode": case.optimistic_admission_check_mode,
                     "postgres_transactions_per_api_batch": case.operations_per_api_batch,
                     "flip_status": "harness_error",
                     "error": f"{type(error).__name__}: {error}"[:4000],

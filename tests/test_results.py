@@ -268,6 +268,13 @@ def v7_parallel_atomic_detach_marker_result() -> dict[str, object]:
     payload["scenario"]["source_proof_mode"] = (
         "parallel_atomic_detach_marker_v1"
     )
+    payload["scenario"].update(
+        {
+            "optimistic_admission_check_mode": "state_only_v1",
+            "optimistic_contract_version": "state_only_batch_first_write_admission_v4",
+            "ownership_epoch_checks_per_api_batch": 0,
+        }
+    )
     payload["marker_fence"].update(
         {
             "mode": "parallel_atomic_detach_marker_v1",

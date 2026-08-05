@@ -13,9 +13,13 @@ if find_spec("psycopg") is not None:
     HotFencedTransactionSession = getattr(
         postgres_io, "HotFencedTransactionSession", None
     )
+    OptimisticDetachTransactionSession = getattr(
+        postgres_io, "OptimisticDetachTransactionSession", None
+    )
 else:
     GuardedTransactionSession = None
     HotFencedTransactionSession = None
+    OptimisticDetachTransactionSession = None
 
 
 class _Result:
@@ -178,6 +182,33 @@ class WriterScopeTests(unittest.TestCase):
         self.assertEqual(hot.commits, 0)
         self.assertEqual(hot.rollbacks, 1)
         self.assertTrue(hot.closed)
+
+    @unittest.skipUnless(find_spec("psycopg") is not None, "psycopg is installed in runner")
+    def test_h_state_only_batch_admission_does_not_send_an_epoch(self) -> None:
+        hot = _HotFencedConnection()
+        manifest = build_manifest(5, "cell01", "retiring")
+        self.assertIsNotNone(OptimisticDetachTransactionSession)
+
+        with patch("flipbench.postgres_io.connect", return_value=hot):
+            session = OptimisticDetachTransactionSession(  # type: ignore[misc,operator]
+                "hot-dsn",
+                manifest,
+                uuid.uuid4(),
+                "retiring",
+                256,
+                expected_ownership_epoch=None,
+                operations_per_batch=5,
+                admission_check_mode="state_only_v1",
+            )
+            inserted = session.write(0, 3)
+            session.close()
+
+        statement, parameters = hot.operations[0]
+        self.assertEqual(inserted, 3)
+        self.assertIn("admit_optimistic_batch_state_only", str(statement))
+        self.assertEqual(len(parameters), 6)
+        self.assertNotIn(7, parameters)
+        self.assertEqual(hot.commits, 1)
 
     @unittest.skipUnless(find_spec("psycopg") is not None, "psycopg is installed in runner")
     def test_target_rate_session_commits_one_selected_table_transaction(self) -> None:

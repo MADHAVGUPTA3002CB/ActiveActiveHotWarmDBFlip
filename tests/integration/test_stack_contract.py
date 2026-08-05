@@ -300,6 +300,66 @@ class StackContractTests(unittest.TestCase):
                     )
                 )
 
+    def test_h_state_only_admission_checks_open_state_without_an_epoch(self) -> None:
+        from psycopg import sql
+
+        from flipbench.core import build_manifest
+        from flipbench.postgres_io import (
+            OptimisticDetachTransactionSession,
+            connect,
+            hot_write_gate_status,
+            park_hot_write_gate,
+            reopen_hot_write_gate,
+        )
+        from flipbench.settings import Settings
+
+        settings = Settings.from_env(5)
+        manifest = build_manifest(5, settings.cell, settings.timeslot)
+        run_id = uuid.uuid4()
+        attempt_id = uuid.uuid4()
+        with connect(settings.hot_dsn, autocommit=True) as admin:
+            gate = hot_write_gate_status(admin, settings.cell, "retiring")
+            session = OptimisticDetachTransactionSession(
+                settings.writer_hot_dsn,
+                manifest,
+                run_id,
+                "retiring",
+                64,
+                expected_ownership_epoch=None,
+                operations_per_batch=1,
+                admission_check_mode="state_only_v1",
+            )
+            parked = False
+            try:
+                self.assertEqual(session.write(0, 1), 1)
+                park_hot_write_gate(
+                    admin,
+                    settings.cell,
+                    "retiring",
+                    attempt_id,
+                    gate.ownership_epoch,
+                )
+                parked = True
+                with self.assertRaisesRegex(RuntimeError, "hot writer parked"):
+                    session.write(1, 1)
+            finally:
+                session.close()
+                if parked:
+                    reopen_hot_write_gate(
+                        admin,
+                        settings.cell,
+                        "retiring",
+                        attempt_id,
+                        None,
+                    )
+                for route in manifest.tables:
+                    admin.execute(
+                        sql.SQL("DELETE FROM {} WHERE experiment_run_id=%s").format(
+                            sql.Identifier(route.leaf)
+                        ),
+                        (run_id,),
+                    )
+
     def test_startup_reconciliation_refuses_a_live_flip_coordinator(self) -> None:
         from flipbench.core import build_manifest
         from flipbench.lifecycle import lifecycle_lock_name

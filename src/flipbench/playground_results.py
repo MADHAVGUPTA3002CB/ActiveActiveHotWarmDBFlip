@@ -66,6 +66,12 @@ def summarize_result(payload: Mapping[str, Any]) -> dict[str, Any]:
     optimistic_contract = scenario.get("optimistic_contract_version")
     if (
         write_fence_mode == "optimistic_detach_v1"
+        and optimistic_contract == "state_only_batch_first_write_admission_v4"
+        and transaction_shape == "api_batch_separate_commits_v1"
+    ):
+        pass
+    elif (
+        write_fence_mode == "optimistic_detach_v1"
         and optimistic_contract == "reserved_batch_first_write_admission_v3"
         and transaction_shape == "api_batch_separate_commits_v1"
     ):
@@ -168,6 +174,14 @@ def summarize_result(payload: Mapping[str, Any]) -> dict[str, Any]:
         "parallel_atomic_detach_marker_v1",
     ):
         source_proof_mode = "slot_lsn_v1" if payload.get("schema_version") in (1, 2, 3, 4) else "legacy/unknown"
+    optimistic_admission_check_mode = scenario.get(
+        "optimistic_admission_check_mode"
+    )
+    if optimistic_admission_check_mode not in (
+        "state_and_epoch_v1",
+        "state_only_v1",
+    ):
+        optimistic_admission_check_mode = "legacy/unknown"
     return {
         "artifact_type": artifact_type,
         "run_id": run_id,
@@ -187,12 +201,16 @@ def summarize_result(payload: Mapping[str, Any]) -> dict[str, Any]:
         "historical_saved_run": True,
         "workload_mode": workload_mode,
         "write_fence_mode": write_fence_mode,
+        "optimistic_admission_check_mode": optimistic_admission_check_mode,
         "transaction_shape": transaction_shape,
         "operations_per_api_batch": _non_negative_integer(
             scenario.get("operations_per_api_batch")
         ),
         "ownership_reads_per_api_batch": _non_negative_integer(
             scenario.get("ownership_reads_per_api_batch")
+        ),
+        "ownership_epoch_checks_per_api_batch": _non_negative_integer(
+            scenario.get("ownership_epoch_checks_per_api_batch")
         ),
         "postgres_transactions_per_api_batch": _non_negative_integer(
             scenario.get("postgres_transactions_per_api_batch")

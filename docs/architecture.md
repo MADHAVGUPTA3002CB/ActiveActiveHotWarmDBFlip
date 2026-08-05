@@ -67,7 +67,7 @@ flowchart TB
 
 ### Hot PostgreSQL
 
-Hot holds the active and retiring leaf partitions. It also holds the local write gate used by variants D–H and the marker tables used by variants F–H. Detach operations change the routing catalog: once a leaf is detached, writes routed through its former parent no longer reach it.
+Hot holds the active and retiring leaf partitions. It also holds the local write gate used by variants D–H and the marker tables used by variants F–H. D checks state and epoch per operation; E–G check them once per API batch; H checks only the open state once per API batch. Detach operations change the routing catalog: once a leaf is detached, writes routed through its former parent no longer reach it.
 
 ### Debezium source and Kafka
 

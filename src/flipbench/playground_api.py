@@ -13,7 +13,14 @@ from typing import Any, Mapping
 
 from .connect_api import ConnectClient, redact_error_detail
 from .connector_configs import fence_source_spec, source_specs
-from .core import FenceWakeupMode, SourceProofMode, TopicPartition, WriteFenceMode, build_manifest
+from .core import (
+    FenceWakeupMode,
+    OptimisticAdmissionCheckMode,
+    SourceProofMode,
+    TopicPartition,
+    WriteFenceMode,
+    build_manifest,
+)
 from .flip import FlipRunner
 from .kafka_io import KafkaControl
 from .playground import (
@@ -297,6 +304,8 @@ class PlaygroundRuntime:
                     "max_queue_size",
                     "rate_window_seconds",
                     "payload_bytes",
+                    "write_fence_mode",
+                    "optimistic_admission_check_mode",
                 }
                 changed = {
                     field for field in frozen_fields if current[field] != updated.to_dict()[field]
@@ -382,13 +391,32 @@ class PlaygroundRuntime:
                         workload_settings.write_fence_mode
                         == WriteFenceMode.OPTIMISTIC_DETACH.value
                     )
+                    admission_check_mode = OptimisticAdmissionCheckMode(
+                        workload_settings.optimistic_admission_check_mode
+                    )
 
                     def hot_session(
                         target_run_id: uuid.UUID,
                         timeslot: str,
                         ownership_epoch: int,
                     ) -> HotFencedTransactionSession | OptimisticDetachTransactionSession:
-                        common = (
+                        if optimistic_batch:
+                            return OptimisticDetachTransactionSession(
+                                self.settings.writer_hot_dsn,
+                                self.manifest,
+                                target_run_id,
+                                timeslot,
+                                workload_settings.payload_bytes,
+                                (
+                                    ownership_epoch
+                                    if admission_check_mode
+                                    is OptimisticAdmissionCheckMode.STATE_AND_EPOCH
+                                    else None
+                                ),
+                                operations_per_batch=self.settings.table_count,
+                                admission_check_mode=admission_check_mode,
+                            )
+                        return HotFencedTransactionSession(
                             self.settings.writer_hot_dsn,
                             self.manifest,
                             target_run_id,
@@ -396,12 +424,6 @@ class PlaygroundRuntime:
                             workload_settings.payload_bytes,
                             ownership_epoch,
                         )
-                        if optimistic_batch:
-                            return OptimisticDetachTransactionSession(
-                                *common,
-                                operations_per_batch=self.settings.table_count,
-                            )
-                        return HotFencedTransactionSession(*common)
 
                     self.workload.start_target_rate(
                         lambda: hot_session(
@@ -473,6 +495,13 @@ class PlaygroundRuntime:
                 SourceProofMode.ATOMIC_DETACH_MARKER,
                 SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER,
             )
+            parallel_marker_variant = (
+                selected_request.source_proof_mode
+                is SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER
+            )
+            admission_check_mode = OptimisticAdmissionCheckMode(
+                workload_settings.optimistic_admission_check_mode
+            )
             if marker_variant and (
                 workload_settings.write_fence_mode
                 != WriteFenceMode.OPTIMISTIC_DETACH.value
@@ -481,6 +510,19 @@ class PlaygroundRuntime:
             ):
                 raise RuntimeError(
                     "Marker variants F, G and H require Variant E writes, isolated sources, and passive heartbeat mode"
+                )
+            if parallel_marker_variant and (
+                admission_check_mode is not OptimisticAdmissionCheckMode.STATE_ONLY
+            ):
+                raise RuntimeError(
+                    "Variant H requires state-only API batch admission"
+                )
+            if (
+                not parallel_marker_variant
+                and admission_check_mode is OptimisticAdmissionCheckMode.STATE_ONLY
+            ):
+                raise RuntimeError(
+                    "state-only API batch admission is reserved for Variant H"
                 )
             if (
                 not marker_variant
@@ -523,6 +565,7 @@ class PlaygroundRuntime:
                 "fence_wakeup_mode": selected_request.fence_wakeup_mode.value,
                 "source_proof_mode": selected_request.source_proof_mode.value,
                 "write_fence_mode": workload_settings.write_fence_mode,
+                "optimistic_admission_check_mode": admission_check_mode.value,
                 "transaction_shape": (
                     "api_batch_separate_commits_v1"
                     if workload_settings.mode == "target_rate_v1"
@@ -538,10 +581,31 @@ class PlaygroundRuntime:
                     == WriteFenceMode.OPTIMISTIC_DETACH.value
                     else self.settings.table_count
                 ),
+                "ownership_epoch_checks_per_api_batch": (
+                    0
+                    if admission_check_mode
+                    is OptimisticAdmissionCheckMode.STATE_ONLY
+                    else (
+                        1
+                        if workload_settings.write_fence_mode
+                        == WriteFenceMode.OPTIMISTIC_DETACH.value
+                        else (
+                            self.settings.table_count
+                            if workload_settings.write_fence_mode
+                            == WriteFenceMode.HOT_TRANSACTIONAL.value
+                            else 0
+                        )
+                    )
+                ),
                 "postgres_transactions_per_api_batch": self.settings.table_count,
                 "api_batch_scheduling": "single_worker_reserved_v1",
                 "optimistic_contract_version": (
-                    "reserved_batch_first_write_admission_v3"
+                    (
+                        "state_only_batch_first_write_admission_v4"
+                        if admission_check_mode
+                        is OptimisticAdmissionCheckMode.STATE_ONLY
+                        else "reserved_batch_first_write_admission_v3"
+                    )
                     if workload_settings.write_fence_mode
                     == WriteFenceMode.OPTIMISTIC_DETACH.value
                     else None

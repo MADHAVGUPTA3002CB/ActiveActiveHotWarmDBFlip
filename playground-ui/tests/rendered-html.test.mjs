@@ -42,8 +42,9 @@ test("keeps the live dashboard and safety copy in the application", async () => 
   assert.match(dashboard, /Ownership grant/);
   assert.match(dashboard, /Immediate fence nudge/);
   assert.match(dashboard, /E — batch admission/i);
-  assert.match(dashboard, /folds one ownership read into the first/i);
-  assert.match(dashboard, /separately committed selected-table operations/i);
+  assert.match(dashboard, /H — state only/i);
+  assert.match(dashboard, /sends no ownership epoch/i);
+  assert.match(dashboard, /separately committed operations/i);
   assert.match(dashboard, /legacy all-tables \/ transaction \(superseded\)/i);
   assert.match(dashboard, /legacy gate read per transaction \(superseded\)/i);
   assert.match(dashboard, /legacy standalone admission transaction \(superseded\)/i);

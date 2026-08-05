@@ -122,6 +122,14 @@ class BenchmarkPlanTests(unittest.TestCase):
             "parallel_atomic_detach_marker_v1",
         )
         self.assertEqual(by_variant["H"].ownership_reads_per_api_batch, 1)
+        self.assertEqual(
+            by_variant["H"].optimistic_admission_check_mode,
+            "state_only_v1",
+        )
+        self.assertEqual(
+            by_variant["G"].optimistic_admission_check_mode,
+            "state_and_epoch_v1",
+        )
 
     def test_rejects_unknown_duplicate_or_unsafe_plan_values(self) -> None:
         for mutate, message in (

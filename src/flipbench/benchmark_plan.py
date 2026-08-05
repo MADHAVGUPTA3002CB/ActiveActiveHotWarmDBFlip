@@ -143,6 +143,17 @@ class BenchmarkCase:
     tables_per_api_transaction: int
     operations_per_api_batch: int
     ownership_reads_per_api_batch: int
+    optimistic_admission_check_mode: str
+
+    @property
+    def ownership_epoch_checks_per_api_batch(self) -> int:
+        if self.variant == "H":
+            return 0
+        if self.variant in ("E", "F", "G"):
+            return 1
+        if self.variant == "D":
+            return self.operations_per_api_batch
+        return 0
 
     @property
     def case_id(self) -> str:
@@ -349,6 +360,11 @@ def build_benchmark_cases(plan: BenchmarkPlan) -> tuple[BenchmarkCase, ...]:
                         1,
                         plan.table_count,
                         1 if variant in ("E", "F", "G", "H") else plan.table_count,
+                        (
+                            "state_only_v1"
+                            if variant == "H"
+                            else "state_and_epoch_v1"
+                        ),
                     )
                 )
     return tuple(cases)

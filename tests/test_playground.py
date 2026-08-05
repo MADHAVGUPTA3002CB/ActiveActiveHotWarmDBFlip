@@ -137,6 +137,27 @@ class WorkloadSettingsTests(unittest.TestCase):
         self.assertEqual(settings.write_fence_mode, "optimistic_detach_v1")
         self.assertEqual(settings.to_dict()["write_fence_mode"], "optimistic_detach_v1")
 
+    def test_accepts_h_state_only_batch_admission_for_optimistic_detach(self) -> None:
+        settings = WorkloadSettings(
+            mode="target_rate_v1",
+            write_fence_mode="optimistic_detach_v1",
+            optimistic_admission_check_mode="state_only_v1",
+        )
+
+        self.assertEqual(settings.optimistic_admission_check_mode, "state_only_v1")
+        self.assertEqual(
+            settings.to_dict()["optimistic_admission_check_mode"],
+            "state_only_v1",
+        )
+
+    def test_rejects_state_only_admission_without_optimistic_detach(self) -> None:
+        with self.assertRaisesRegex(ValueError, "state_only_v1"):
+            WorkloadSettings(
+                mode="target_rate_v1",
+                write_fence_mode="hot_transactional_v1",
+                optimistic_admission_check_mode="state_only_v1",
+            )
+
     def test_rejects_unknown_or_mistyped_write_fence_mode(self) -> None:
         for value in ("warm_remote", "", True, None):
             with self.subTest(value=value), self.assertRaisesRegex(

@@ -29,6 +29,62 @@ def isolated_settings() -> Settings:
 
 @unittest.skipUnless(find_spec("psycopg") is not None, "psycopg is installed in the runner image")
 class PublicationContractTests(unittest.TestCase):
+    def test_variant_h_requires_state_only_application_admission(self) -> None:
+        from flipbench.core import SourceProofMode
+        from flipbench.flip import FlipRunner
+
+        configured = isolated_settings()
+        scenario = {
+            "write_fence_mode": "optimistic_detach_v1",
+            "retiring_write_gate_epoch": 1,
+            "optimistic_admission_check_mode": "state_only_v1",
+        }
+        runner = FlipRunner(
+            configured,
+            uuid.uuid4(),
+            1.0,
+            0.05,
+            scenario_metadata=scenario,
+            source_proof_mode=SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER,
+        )
+        self.assertEqual(
+            runner.optimistic_admission_check_mode.value,
+            "state_only_v1",
+        )
+
+        with self.assertRaisesRegex(ValueError, "Variant H"):
+            FlipRunner(
+                configured,
+                uuid.uuid4(),
+                1.0,
+                0.05,
+                scenario_metadata={
+                    **scenario,
+                    "optimistic_admission_check_mode": "state_and_epoch_v1",
+                },
+                source_proof_mode=(
+                    SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER
+                ),
+            )
+
+    def test_state_only_application_admission_is_not_enabled_for_g(self) -> None:
+        from flipbench.core import SourceProofMode
+        from flipbench.flip import FlipRunner
+
+        with self.assertRaisesRegex(ValueError, "reserved for Variant H"):
+            FlipRunner(
+                isolated_settings(),
+                uuid.uuid4(),
+                1.0,
+                0.05,
+                scenario_metadata={
+                    "write_fence_mode": "optimistic_detach_v1",
+                    "retiring_write_gate_epoch": 1,
+                    "optimistic_admission_check_mode": "state_only_v1",
+                },
+                source_proof_mode=SourceProofMode.ATOMIC_DETACH_MARKER,
+            )
+
     def test_immediate_heartbeat_runs_after_fence_persistence_before_slot_wait(self) -> None:
         from flipbench.core import FenceWakeupMode, HotSourceIdentity
         from flipbench.flip import FlipRunner

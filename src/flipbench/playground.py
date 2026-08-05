@@ -6,7 +6,12 @@ from queue import Empty, SimpleQueue
 from threading import Event, Lock, Thread
 from typing import Callable, Mapping
 
-from .core import FenceWakeupMode, SourceProofMode, WriteFenceMode
+from .core import (
+    FenceWakeupMode,
+    OptimisticAdmissionCheckMode,
+    SourceProofMode,
+    WriteFenceMode,
+)
 from .traffic import TrafficLane, TrafficSnapshot, TrafficTarget, TrafficWorker
 
 
@@ -56,6 +61,9 @@ class WorkloadSettings:
     rate_window_seconds: int = 5
     min_achievement_percent: int = 80
     write_fence_mode: str = WriteFenceMode.WARM_TRACKER_ADVISORY.value
+    optimistic_admission_check_mode: str = (
+        OptimisticAdmissionCheckMode.STATE_AND_EPOCH.value
+    )
 
     def __post_init__(self) -> None:
         _bounded_integer("active_rows_per_partition", self.active_rows_per_partition, 1, 100_000)
@@ -78,6 +86,21 @@ class WorkloadSettings:
         ) and self.mode != "target_rate_v1":
             raise ValueError(
                 f"{guard_mode.value} requires target_rate_v1 workload mode"
+            )
+        try:
+            admission_check_mode = OptimisticAdmissionCheckMode(
+                self.optimistic_admission_check_mode
+            )
+        except ValueError as error:
+            raise ValueError(
+                "optimistic_admission_check_mode must be state_and_epoch_v1 or state_only_v1"
+            ) from error
+        if (
+            admission_check_mode is OptimisticAdmissionCheckMode.STATE_ONLY
+            and guard_mode is not WriteFenceMode.OPTIMISTIC_DETACH
+        ):
+            raise ValueError(
+                "state_only_v1 admission requires optimistic_detach_v1"
             )
         _bounded_integer("active_target_tps", self.active_target_tps, 1, 1_000_000)
         _bounded_integer("retiring_target_tps", self.retiring_target_tps, 1, 1_000_000)

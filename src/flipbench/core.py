@@ -28,6 +28,11 @@ class WriteFenceMode(StrEnum):
     OPTIMISTIC_DETACH = "optimistic_detach_v1"
 
 
+class OptimisticAdmissionCheckMode(StrEnum):
+    STATE_AND_EPOCH = "state_and_epoch_v1"
+    STATE_ONLY = "state_only_v1"
+
+
 class FlipbenchError(ValueError):
     """Base class for fail-closed validation errors."""
 

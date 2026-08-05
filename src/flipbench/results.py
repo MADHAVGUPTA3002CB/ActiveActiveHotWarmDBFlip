@@ -723,6 +723,26 @@ def validate_result(payload: Mapping[str, Any]) -> None:
                     raise ResultValidationError(
                         "legacy Variant E first-write admission evidence is inconsistent"
                     )
+            elif contract_version == "state_only_batch_first_write_admission_v4":
+                if (
+                    scenario.get("source_proof_mode")
+                    != "parallel_atomic_detach_marker_v1"
+                    or scenario.get("optimistic_admission_check_mode")
+                    != "state_only_v1"
+                    or transaction_shape != "api_batch_separate_commits_v1"
+                    or tables_per_transaction != 1
+                    or scenario.get("operations_per_api_batch") != table_count
+                    or scenario.get("ownership_reads_per_api_batch") != 1
+                    or scenario.get("ownership_epoch_checks_per_api_batch") != 0
+                    or scenario.get("postgres_transactions_per_api_batch")
+                    != table_count
+                    or scenario.get("partial_batch_completion_allowed") is not True
+                    or scenario.get("api_batch_scheduling")
+                    != "single_worker_reserved_v1"
+                ):
+                    raise ResultValidationError(
+                        "Variant H state-only batch-admission evidence is inconsistent"
+                    )
             else:
                 if (
                     contract_version != "reserved_batch_first_write_admission_v3"

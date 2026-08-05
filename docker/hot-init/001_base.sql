@@ -197,6 +197,37 @@ ALTER FUNCTION flipbench_guard.admit_optimistic_batch(text, text, bigint)
 OWNER TO flipbench_guard_owner;
 REVOKE ALL ON FUNCTION flipbench_guard.admit_optimistic_batch(text, text, bigint) FROM PUBLIC;
 
+CREATE OR REPLACE FUNCTION flipbench_guard.admit_optimistic_batch_state_only(
+    p_cell text,
+    p_timeslot text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    gate_state text;
+BEGIN
+    IF p_timeslot NOT IN ('active', 'retiring') THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'unknown optimistic batch timeslot';
+    END IF;
+    SELECT gate.state
+    INTO gate_state
+    FROM flipbench_guard.partition_write_gates AS gate
+    WHERE gate.cell = p_cell AND gate.timeslot = p_timeslot;
+
+    IF NOT FOUND OR gate_state <> 'open' THEN
+        RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'hot writer parked: optimistic state-only batch admission rejected';
+    END IF;
+    RETURN true;
+END;
+$$;
+
+ALTER FUNCTION flipbench_guard.admit_optimistic_batch_state_only(text, text)
+OWNER TO flipbench_guard_owner;
+REVOKE ALL ON FUNCTION flipbench_guard.admit_optimistic_batch_state_only(text, text) FROM PUBLIC;
+
 CREATE OR REPLACE FUNCTION flipbench_guard.insert_events_optimistic(
     p_cell text,
     p_timeslot text,
