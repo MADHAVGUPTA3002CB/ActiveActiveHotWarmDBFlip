@@ -67,7 +67,7 @@ flowchart TB
 
 ### Hot PostgreSQL
 
-Hot holds the active and retiring leaf partitions. It also holds the local write gate used by variants D–H and the marker tables used by variants F–H. D checks state and epoch per operation; E–G check them once per API batch; H checks only the open state once per API batch. Detach operations change the routing catalog: once a leaf is detached, writes routed through its former parent no longer reach it.
+Hot holds the active and retiring leaf partitions. It also holds the local write gate used by revised A and variants D–H, and the marker tables used by variants F–H. D checks state and epoch per operation; E–G check them once per API batch; revised A and H check only the open state once per API batch. Detach operations change the routing catalog: once a leaf is detached, writes routed through its former parent no longer reach it.
 
 For indexed workload-mix experiments across A–H, the control plane first inserts an unmeasured seed pool into every selected timeslot/table. The single lane scheduler deterministically labels each transaction as INSERT or UPDATE and assigns UPDATE target positions independently per table. Worker sessions update `payload` and `updated_at` through the partitioned parent using the immutable `(id, created_at)` key while preserving that variant's existing warm-tracker, hot-epoch, or optimistic-batch guard. A zero-row update after detach is converted into the same fail-closed writer-park result as an insert/detach race.
 
@@ -120,7 +120,20 @@ The measured stage labels `t0` through `t13` are monotonic-clock timestamps. The
 
 ### LSN and consumer offsets (A–E)
 
-The coordinator records a hot WAL fence, waits until the migration slot's `confirmed_flush_lsn` reaches it, captures the target next offset for every retiring topic-partition, and waits until the sink group's committed next offset reaches every target component. Offsets are compared component by component; they are never summed.
+The coordinator records a hot WAL fence and waits until the migration slot's
+`confirmed_flush_lsn` reaches it. It then starts a `read_committed` observer at each
+retiring topic-partition's current sink-group position and scans to partition EOF. The
+target is the next offset after the last visible data record, or the scan start when no
+data record remains. Finally, it waits until the sink group's committed next offset
+reaches every target component. Offsets are compared component by component; they are
+never summed.
+
+The target must not be Kafka's broker high watermark. Exactly-once source transactions
+append internal commit/control records that occupy offsets but are not delivered to the
+JDBC sink. A high-watermark target can therefore remain one offset ahead forever even
+after all business records have reached warm. Every run records
+`target_offset_semantics=read_committed_visible_records_v1` at `t8` so legacy and
+transaction-aware results remain distinguishable.
 
 This proof is conservative. A logical slot scans the global WAL, so unrelated active WAL before the fence may still contribute to source-fence latency even with separate publications/connectors.
 

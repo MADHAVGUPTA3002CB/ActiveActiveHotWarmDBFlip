@@ -4,25 +4,21 @@
 
 **Decision state:** validating for production
 
-This document describes the selected production-style design for moving a retiring PostgreSQL timeslot from hot ownership to warm ownership using Variant H.
+This guide describes how to move a retiring PostgreSQL timeslot from hot ownership to warm
+ownership using Variant H with **one** Debezium source connector. A marker receipt is the
+ownership proof, and it is only valid when it shows that every earlier business record from the
+same Kafka partition is already durable on warm — the Section 5.4 sink contract is therefore a
+mandatory validation gate.
 
-The architecture is feasible, but the warm sink ordering contract in Section 5.4 is a mandatory validation gate. A marker receipt is useful only when it proves that earlier business records from the same Kafka partition are already durable on warm.
+The design per cell: one hot PostgreSQL, one warm PostgreSQL, one publication, one logical
+replication slot, one Debezium source connector, one single-partition Kafka topic per business
+leaf, one marker-aware warm sink, and one partition lifecycle / flip-control service.
 
-The selected design uses:
+"One Debezium connector" means one logical source connector, slot, and source task. The Kafka
+Connect worker cluster still runs on multiple hosts for availability, and a separate sink task
+still consumes Kafka and writes warm.
 
-- one hot PostgreSQL database per cell or database shard;
-- one warm PostgreSQL database;
-- one PostgreSQL publication for the hot cell;
-- one logical replication slot;
-- one Debezium PostgreSQL **source connector**;
-- one Kafka topic for every physical business leaf;
-- exactly one Kafka partition in every leaf topic;
-- one marker-aware warm sink that writes Kafka records to warm PostgreSQL;
-- one partition lifecycle and flip-control service.
-
-“One Debezium connector” means one logical PostgreSQL source connector, slot, and source task. The Kafka Connect worker service may still run on multiple production hosts for availability. A separate sink task is still required because it consumes Kafka and writes warm PostgreSQL.
-
-## 1. Simple picture
+## 1. Big picture
 
 ```mermaid
 flowchart LR
@@ -31,100 +27,80 @@ flowchart LR
     ROUTER -->|"warm_primary"| WARM["Warm PostgreSQL"]
     ROUTER -->|"parked"| RETRY["Reject or retry"]
 
-    CONTROL["Partition lifecycle and flip-control service"] --> ROUTER
+    CONTROL["Lifecycle + flip-control service"] --> ROUTER
     CONTROL --> HOT
     CONTROL --> WARM
-    CONTROL --> KAFKA["Kafka administration"]
-    CONTROL --> CONNECT["Kafka Connect administration"]
+    CONTROL --> KAFKA["Kafka / Connect administration"]
 
     HOT --> PUB["One publication"]
     PUB --> SLOT["One logical slot"]
     SLOT --> SOURCE["One Debezium source connector"]
-    SOURCE --> TOPICS["One topic partition per business leaf"]
+    SOURCE --> TOPICS["One topic-partition per leaf"]
     TOPICS --> SINK["Marker-aware warm sink"]
     SINK --> WARM
 ```
 
-Before the flip, hot PostgreSQL owns the timeslot. During the flip, the retiring route is parked. Variant H detaches every retiring leaf and creates one terminal marker per leaf. After all exact markers reach warm PostgreSQL, ownership changes to warm.
+Before the flip, hot owns the timeslot. The flip parks the retiring route, detaches every
+retiring leaf together with one terminal marker each, waits for every exact marker receipt on
+warm, then changes ownership. Active timeslots keep writing to hot throughout.
 
-Active timeslots remain writable on hot PostgreSQL throughout the retiring-timeslot flip. However, each non-concurrent detach briefly takes a strong lock on its parent table, so active writes to that same parent can wait. Active p95/p99 latency during the parallel detach burst is therefore an explicit production SLO and load-test requirement.
+Two properties carry the whole design:
 
-## 2. The main correctness rule
+- **The detach is the real fence.** The application's route check is a latency/UX optimization,
+  not the safety mechanism. Even a client that skips the route check cannot corrupt the proof:
+  a write that commits before detach lands before the marker in WAL order and reaches warm; a
+  write after detach fails because the leaf is gone. The once-per-batch check is safe because
+  the database, not the application, enforces the fence.
+- **Each non-concurrent detach briefly takes an `ACCESS EXCLUSIVE` lock on its parent**, so
+  active writes to that parent can wait. Section 7 Step 4 gives measured numbers and the
+  mandatory `lock_timeout` rule; active p95/p99 during the detach burst is an explicit SLO.
 
-Warm ownership must never be granted until all of the following are true:
+## 2. The correctness rule
+
+Warm ownership is never granted until **all** of the following hold:
 
 1. New retiring API batches are stopped.
 2. Every retiring business leaf is detached from its hot parent.
 3. A unique marker for every leaf is present in that leaf's Kafka topic-partition.
-4. The warm sink has committed all business records before each marker.
-5. The warm sink has committed every exact marker receipt on warm PostgreSQL.
-6. PostgreSQL catalog checks confirm that every expected leaf is detached.
-7. The ownership transition succeeds for the current flip attempt only.
+4. The warm sink has committed all business records that precede each marker.
+5. The warm sink has committed every exact marker receipt on warm.
+6. PostgreSQL catalog checks confirm every expected leaf is detached.
+7. The ownership transition succeeds for the current flip attempt only (epoch compare-and-set).
 
-Variant H does not use a global LSN comparison or aggregate Kafka lag as its ownership proof. LSN and lag remain useful monitoring information, but the exact per-leaf markers and warm receipts are the proof.
+There is no global LSN comparison and no aggregate lag check in the proof. LSN and lag remain
+monitoring signals only.
 
 ## 3. Production components
 
 | Component | Responsibility |
 |---|---|
-| Business API | Reads the ownership state once at the start of an API-style batch and writes to the selected database |
-| Route/gate store | Returns `hot_primary`, `parked`, or `warm_primary` for a cell and timeslot |
-| Hot PostgreSQL | Owns active and not-yet-retired data; holds partitioned business parents and private marker tables |
-| Flip-control service | Provisions generations, parks writes, runs Variant H, recovers failures, grants ownership, and performs delayed cleanup |
-| PostgreSQL publication | Selects business parents and marker tables for CDC |
-| Logical replication slot | Stores the one source connector's durable WAL position |
-| Debezium source connector | Converts committed hot PostgreSQL row changes into Kafka records |
-| Leaf Kafka topics | Preserve business-record and marker order for each leaf |
-| Marker-aware warm sink | Upserts business records and makes a marker receipt visible only after all earlier records from that topic-partition are durable |
-| Warm PostgreSQL | Holds replicated business data, exact marker receipts, ownership state, and the flip journal |
-| Result/audit store | Preserves commands, timings, evidence, errors, recovery actions, and final outcomes |
+| Business API | Reads the route once per API-style batch; writes to the selected database with stable idempotency keys |
+| Route/gate store | Returns `hot_primary`, `parked`, or `warm_primary` per cell and timeslot |
+| Hot PostgreSQL | Active and not-yet-retired data; partitioned parents and private marker tables |
+| Flip-control service | Provisions generations, parks, runs Variant H, recovers, grants, performs delayed cleanup |
+| Publication + slot | Select tables for CDC; store the connector's durable WAL position |
+| Debezium source connector | Emits committed hot row changes into per-leaf Kafka topics |
+| Marker-aware warm sink | Upserts business records; makes a receipt visible only after all earlier records from that partition are durable |
+| Warm PostgreSQL | Replicated data, exact receipts, ownership state, flip journal |
+| Result/audit store | Commands, timings, evidence, errors, recovery actions, outcomes |
 
-The flip-control service is an operational control-plane application. It should not be mixed into ordinary business request handlers. It needs stronger privileges, durable workflow state, strict authorization, and a complete audit trail.
+The flip-control service is a control-plane application — separate from business request
+handlers, with stronger privileges, durable workflow state, and a full audit trail.
 
 ## 4. Naming and mapping example
 
-Assume a cell has these two business parents:
+For business parents `public.orders` and `public.refunds`, generation `2026_08_05_00`:
 
-```text
-public.orders
-public.refunds
-```
+| Object | Name |
+|---|---|
+| Hot business leaf | `public.orders_p_2026_08_05_00` |
+| Private marker table | `flip_control.orders_p_2026_08_05_00` |
+| Kafka topic (final) | `cards.cell01.public.orders_p_2026_08_05_00` |
 
-For generation `2026_08_05_00`, the hot business leaves are:
-
-```text
-public.orders_p_2026_08_05_00
-public.refunds_p_2026_08_05_00
-```
-
-The private marker tables are separate PostgreSQL tables:
-
-```text
-flip_control.orders_p_2026_08_05_00
-flip_control.refunds_p_2026_08_05_00
-```
-
-The final Kafka topics are:
-
-```text
-cards.cell01.public.orders_p_2026_08_05_00
-cards.cell01.public.refunds_p_2026_08_05_00
-```
-
-There is no separate final marker topic. Debezium initially identifies a marker record by its marker-table topic name, adds a trusted marker header, and routes it into the matching business-leaf topic.
-
-Example:
-
-```text
-Natural marker topic:
-cards.cell01.flip_control.orders_p_2026_08_05_00
-
-After source routing:
-cards.cell01.public.orders_p_2026_08_05_00
-Header: hotwarm-control=leaf-fence-v1
-```
-
-The one-partition topic then contains an ordered stream similar to:
+There is no separate marker topic. Debezium identifies a marker record by its marker-table
+source topic, adds a trusted header (`hotwarm-control=leaf-fence-v1`), and rewrites the topic
+so the marker lands in the matching business-leaf topic. The one-partition topic then holds an
+ordered stream that ends, at flip time, with the marker:
 
 ```text
 offset 4201  business INSERT
@@ -133,23 +109,16 @@ offset 4203  business UPDATE
 offset 4204  exact Variant H marker
 ```
 
-Seeing offset `4204` proves that all earlier records reached Kafka. The marker-aware warm receipt proves that all earlier records are durable on warm before ownership is granted.
+Observing offset 4204 proves the whole leaf stream reached Kafka; the ordered warm receipt
+proves it is durable on warm.
 
-## 5. One-time platform setup
+## 5. Platform setup
 
 ### 5.1 Hot PostgreSQL
 
-Create:
-
-- all partitioned business parent tables;
-- the private `flip_control` schema;
-- a hot-local write gate or equivalent route-enforcement table;
-- the Debezium heartbeat table;
-- application, control-plane, DDL, and replication roles;
-- one publication with `publish_via_partition_root=false`;
-- one logical replication slot, normally managed deliberately rather than accidentally recreated.
-
-Example publication:
+Create once: the partitioned business parents, the private `flip_control` schema, the route/gate
+enforcement table, the Debezium heartbeat table, least-privilege roles, one publication, one
+deliberately managed logical slot.
 
 ```sql
 CREATE PUBLICATION cell01_hotwarm_cdc
@@ -160,15 +129,32 @@ WITH (
 );
 ```
 
-Publishing each stable partitioned parent automatically covers its current and future partitions. Because `publish_via_partition_root=false`, PostgreSQL identifies events using the physical leaf rather than the parent.
+Publishing a partitioned parent automatically covers its current and future partitions;
+`publish_via_partition_root=false` makes events carry the physical leaf identity, which is what
+routes each leaf to its own topic.
 
-This example supports `INSERT` and `UPDATE`, matching the current prototype. If production permits `DELETE`, it must be enabled and verified through the publication, Debezium record, Kafka key, warm sink, reconciliation, and recovery paths before deployment.
+Two hard requirements follow from `publish = 'insert, update'`:
 
-### 5.2 Stable Debezium source configuration
+- **Partition keys must be immutable, enforced by a trigger.** An UPDATE that changes the
+  partition key becomes a cross-partition row move, which logical decoding emits as
+  DELETE + INSERT on two different leaves. With DELETE unpublished, warm silently keeps the old
+  row *and* gains the new one. The key-immutability trigger (Section 6 Phase A) is part of the
+  ownership proof, not an optional guard.
+- If production needs DELETE, it must be added to the publication and verified end to end
+  (record shape, Kafka key, sink behavior, reconciliation) before deployment.
 
-The connector should use stable allowlisted naming patterns. It should not list every timestamped leaf individually.
+**Slot survival across failover is a platform requirement.** The single slot is the only WAL
+position the design has. On hot-primary failover, logical slots do not exist on the promoted
+standby unless slot synchronization is configured: PostgreSQL 17+, the slot created with
+`failover = true`, `sync_replication_slots = on` on the standby, and
+`synchronized_standby_slots` on the primary so WAL is not recycled ahead of the standby's copy.
+Without this, a failover strands the connector and loses the CDC position — during a flip that
+is a stuck attempt; in steady state it is silent warm data loss recoverable only by backfill.
 
-Conceptual configuration:
+### 5.2 Debezium source configuration
+
+Stable allowlisted patterns, never per-leaf lists — creating a new timeslot must not require a
+connector change or restart:
 
 ```json
 {
@@ -180,123 +166,117 @@ Conceptual configuration:
   "publication.name": "cell01_hotwarm_cdc",
   "publication.autocreate.mode": "disabled",
   "snapshot.mode": "no_data",
-  "table.include.list": "public\\.(orders|refunds)_p_[0-9]{8}_[0-9]{2},flip_control\\.(orders|refunds)_p_[0-9]{8}_[0-9]{2},public\\.dbz_heartbeat",
+  "table.include.list": "public\\.(orders|refunds)_p_[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{2},flip_control\\.(orders|refunds)_p_[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{2},public\\.dbz_heartbeat",
+  "heartbeat.interval.ms": "10000",
+  "heartbeat.action.query": "UPDATE public.dbz_heartbeat SET touched_at = clock_timestamp() WHERE id = 1",
   "producer.override.acks": "all",
   "producer.override.enable.idempotence": "true",
-  "errors.tolerance": "none"
+  "errors.tolerance": "none",
+  "exactly.once.support": "required",
+  "transaction.boundary": "poll"
 }
 ```
 
-The exact regex must be generated from an allowlisted parent-table registry, not from arbitrary API text. Debezium treats include expressions as anchored expressions against the complete `schema.table` name.
+Notes on deliberate choices:
 
-The source connector also needs stable predicate/SMT rules:
+- **The include regex must be generated from the registered parent-table allowlist**, never
+  hand-written or built from API input. Debezium anchors each expression against the full
+  `schema.table` name. The pattern above matches the `_p_YYYY_MM_DD_HH` naming used throughout
+  this guide.
+- **The heartbeat has nothing to do with the flip proof.** Variant H never waits on slot LSN;
+  the marker itself is the migration-lane work, so B+'s flip-time "fence nudge" heartbeat is
+  gone. The `heartbeat.action.query` here solves a different, steady-state problem: a logical
+  slot only advances when the connector processes **captured** events, while the cluster keeps
+  writing WAL the publication does not capture (autovacuum, checkpoints, unpublished
+  control-plane tables). If business tables go quiet — maintenance window, write freeze,
+  overnight lull — the slot pins WAL and hot-database disk fills. One captured single-row
+  UPDATE every ~10 s guarantees the slot always advances. Drop it only if you can guarantee
+  the published tables are never idle, and even then keep the retained-WAL alert.
+- **Exactly-once source is the selected mode** (matching the prototype). It requires
+  `exactly.once.source.support = enabled` on the Connect worker cluster, and it is what makes
+  the coordinator's `read_committed` marker observer meaningful. If a deployment instead
+  accepts at-least-once, it must document and test the duplicate argument explicitly
+  (post-crash duplicates re-append *after* the original marker; idempotent upserts and the
+  receipt's unique keys absorb them) and drop `read_committed` assumptions — do not mix the
+  two modes' reasoning.
 
-1. Match only `cards.cell01.flip_control.<approved_leaf>` topics.
-2. Add the control header.
-3. Rewrite the topic to `cards.cell01.public.<same_leaf>`.
-4. Leave business records unchanged.
-
-The connector configuration changes only when the registered set of business parent tables or naming policy changes. Creating another timeslot should not require a connector update or restart.
+The connector also carries the stable marker SMT rules: a predicate matching only
+`cards.cell01.flip_control.<leaf>` topics, an `InsertHeader` adding the control header, and a
+`RegexRouter` rewriting the topic to `cards.cell01.public.<leaf>`. Business records pass
+through unchanged.
 
 ### 5.3 Kafka
 
-Create every business-leaf topic explicitly with:
+Create every leaf topic explicitly, before its leaf can produce records: exactly **one
+partition** (a correctness requirement — one marker proves one totally-ordered stream),
+production replication factor and `min.insync.replicas`, retention covering the migration
+window plus replay slack, TLS/SASL with least-privilege ACLs, and auto-topic creation disabled.
+Partition count can never be increased later on these topics.
 
-- exactly one partition;
-- the approved production replication factor;
-- an appropriate minimum in-sync replica value;
-- retention long enough for replay and recovery;
-- TLS/SASL and least-privilege ACLs;
-- auto-topic creation disabled or tightly restricted.
+### 5.4 Warm sink: the receipt-ordering contract
 
-Exactly one partition is a correctness requirement for the current marker proof. Kafka partitions cannot later be reduced, and adding partitions would invalidate the assumption that one marker proves the entire leaf stream.
+The sink subscribes with a stable allowlisted leaf-topic regex. Per record: no marker header →
+upsert into the warm business table; valid marker header → write to
+`public.hotwarm_leaf_fence_receipts`; anything unexpected → stop and alert, never skip.
 
-### 5.4 Warm sink and PostgreSQL
+Receipt table keys: `PRIMARY KEY (attempt_id, leaf_name)`, `UNIQUE (marker_id)`.
 
-The sink subscribes using a stable allowlisted leaf-topic regex.
-
-For each record:
-
-- no marker header: route it to the correct warm business table;
-- valid marker header: route it to `public.hotwarm_leaf_fence_receipts`;
-- invalid schema, unknown table, or failed write: stop and alert rather than silently skip.
-
-The warm receipt table uses unique constraints such as:
-
-```sql
-PRIMARY KEY (attempt_id, leaf_name)
-UNIQUE (marker_id)
-```
-
-The sink must be retry-safe. It acknowledges or commits Kafka progress only after the corresponding warm PostgreSQL transaction commits.
-
-#### Mandatory receipt-ordering contract
-
-For each Kafka topic-partition, the sink must guarantee:
+**The mandatory contract, per Kafka topic-partition:**
 
 ```text
 all business records before marker M are durable on warm
-before receipt(M) becomes visible to the flip coordinator
+BEFORE receipt(M) becomes visible to the flip coordinator
 ```
 
-The Debezium JDBC sink documents at-least-once delivery, but that statement alone does not promise that writes to multiple destination tables become visible in the order required by this proof. Business records go to business tables while marker records go to the receipt table, so the guarantee must be tested rather than assumed.
+The generic Debezium JDBC sink documents at-least-once delivery only. Because business records
+and markers go to *different destination tables*, batching can make the receipt visible before
+earlier business rows are durable. This must never be assumed away.
 
-The recommended production implementation is a **marker-aware sink transaction**:
+The recommended implementation is the classic **offsets-in-database exactly-once sink**:
 
-1. Consume each leaf topic-partition in Kafka order.
-2. Apply its business records idempotently.
-3. When marker `M` is reached, commit all pending business writes and `receipt(M)` in one warm PostgreSQL transaction.
-4. Only after that transaction commits, allow Kafka progress beyond `M` to be acknowledged.
-5. On retry, upserts and the receipt's unique keys make the batch idempotent.
+1. Consume each leaf topic-partition in order; apply business records idempotently.
+2. On reaching marker `M`, commit pending business rows, `receipt(M)`, and the consumer
+   position in **one warm PostgreSQL transaction**.
+3. Acknowledge Kafka progress past `M` only after that transaction commits.
+4. On retry, the upserts and receipt keys make replay idempotent.
 
-This can be implemented as a small custom Kafka Connect sink/consumer or as a rigorously verified extension of the selected JDBC sink version. Do not use undocumented connector behavior as a permanent correctness assumption.
+If the generic JDBC sink is kept instead, the conservative fallback is to require **both** the
+exact receipt **and** the sink consumer group's committed offset strictly past the marker's
+offset, per partition. A separate marker-only consumer is never sufficient — it can race ahead
+of the business writer.
 
-If the generic JDBC sink is retained without this atomic receipt contract, the conservative fallback is to require both the exact warm receipt and the sink consumer group's committed offset beyond the exact marker offset. That reintroduces a component-wise sink-offset check, but it is safer than granting ownership from an early receipt.
-
-Running a completely separate marker consumer is not sufficient: it could write the receipt before the business sink has applied earlier records.
-
-The marker record and business record have different schemas even though they share a topic. Every consumer must be header-aware and schema-compatible. This is a production acceptance gate, especially when Schema Registry is used.
+**Schema strategy is an acceptance gate, not a footnote.** Markers and business records share a
+topic with different value schemas. With Schema Registry, the default `TopicNameStrategy`
+rejects that (or forces compatibility `NONE`, destroying evolution protection for business
+schemas). Choose explicitly: `RecordNameStrategy`/`TopicRecordNameStrategy` for leaf topics, or
+schemaless JSON with header-based dispatch. Every downstream consumer must be header-aware.
 
 ### 5.5 Control-plane data
 
-The durable control-plane model should include at least:
-
 | Table | Purpose |
 |---|---|
-| `partition_generations` | Desired and observed state for every cell/timeslot generation |
-| `partition_leaves` | Exact parent, hot leaf, marker table, topic, and warm target manifest |
-| `partition_routes` | Authoritative `hot_primary`, `parked`, or `warm_primary` route |
-| `flip_attempts` | Attempt ID, epoch, phase, deadlines, actor, error, and final outcome |
+| `partition_generations` | Desired and observed state per cell/timeslot generation |
+| `partition_leaves` | Manifest: parent, hot leaf, marker table, topic, warm target |
+| `partition_routes` | Authoritative `hot_primary` / `parked` / `warm_primary` route |
+| `flip_attempts` | Attempt ID, epoch, phase, deadlines, actor, outcome |
 | `flip_table_states` | Per-leaf attach/detach/recovery state and timings |
-| `flip_marker_intents` | Expected marker ID and Kafka partition for each leaf |
+| `flip_marker_intents` | Expected marker ID and topic-partition per leaf |
 | `hotwarm_leaf_fence_receipts` | Exact markers committed by the warm sink |
-| `operation_audit` | Commands, approvals, observations, retries, and operator actions |
+| `operation_audit` | Commands, approvals, observations, retries, operator actions |
 
-The application does not need the epoch for every business write. Variant H checks route state once per API-style batch. Attempt and ownership epochs are used by the flip-control service to prevent an old or retried flip from parking, granting, or recovering a newer attempt.
+The application never sends an epoch — Variant H checks route state once per API batch.
+Attempt and ownership epochs live inside the flip-control service, where they stop an old or
+retried flip from parking, granting, or recovering a newer attempt.
 
 ### 5.6 Control API and job model
 
-All long-running operations should be durable jobs. An HTTP timeout must not cancel or lose the underlying operation.
-
-Example control operations:
-
-| Operation | Purpose |
-|---|---|
-| `create generation` | Store the validated parent/leaf/topic manifest and idempotency key |
-| `reconcile generation` | Create or repair missing hot, warm, publication, and Kafka objects |
-| `activate generation` | Open routing only after every readiness check passes |
-| `start retirement` | Mark the generation as the next flip candidate |
-| `start flip` | Create an exact attempt and run the Variant H state machine |
-| `recover attempt` | Resume or revert a failed/incomplete attempt from observed state |
-| `approve cleanup` | Record retention, reconciliation, backup, and operator approval |
-| `run cleanup` | Remove only objects that are durably marked cleanup-eligible |
-| `get status/evidence` | Return current state, blockers, timings, markers, and operator guidance |
-
-Every mutating request requires authentication, authorization, a stable idempotency key, and an expected current state. The service returns the durable job ID immediately; operators or automation poll/stream its status. Only manifests built from the registered table allowlist can reach PostgreSQL or Kafka administration code.
+All mutating operations are durable jobs (an HTTP timeout must not lose an operation):
+`create/reconcile/activate generation`, `start retirement`, `start flip`, `recover attempt`,
+`approve cleanup`, `run cleanup`, `get status/evidence`. Every mutation requires
+authentication, authorization, an idempotency key, and an expected current state; only
+manifests built from the registered allowlist reach PostgreSQL or Kafka administration code.
 
 ## 6. Recurring partition lifecycle
-
-The control service repeats this lifecycle for every new timeslot.
 
 ```mermaid
 stateDiagram-v2
@@ -315,25 +295,27 @@ stateDiagram-v2
     cleanup_eligible --> cleaned: controlled deletion finishes
 ```
 
-### Phase A: provision the future generation
+### Phase A: provision the future generation (ahead of traffic)
 
-Run this minutes or hours before the generation receives traffic.
+For every registered business parent, **in this order** — everything the leaf's CDC path needs
+exists *before* the leaf becomes publication-covered by the attach:
 
-For every registered business parent:
+1. Create the future leaf **unattached**, with indexes, constraints, grants, storage settings,
+   replica identity, the bound `CHECK` constraint, **and the key-immutability trigger**
+   (`LIKE parent INCLUDING ALL` copies indexes and constraints but **not** triggers).
+2. Create its private marker table and add the marker table to the publication.
+3. Create the one-partition Kafka leaf topic.
+4. Create or validate the warm destination table.
+5. Verify the source connector and warm sink are running.
+6. **Attach the leaf** — with the matching `CHECK` already present, attach validates from the
+   constraint and takes only a brief `SHARE UPDATE EXCLUSIVE` on the parent.
+7. Send a provisioning canary marker; verify its exact Kafka event and warm receipt.
+8. Compare desired vs observed state (catalogs, publication membership, topic metadata,
+   connector config, warm schema); move `provisioning → ready` only when every check passes.
 
-1. Create the future business leaf.
-2. Create its indexes, constraints, grants, storage settings, and replica identity.
-3. Attach it to the parent with the correct time bounds.
-4. Create its matching private marker table.
-5. Add the marker table to the existing publication.
-6. Create the final one-partition Kafka leaf topic.
-7. Create or validate the warm destination.
-8. Verify the source connector and warm sink are running.
-9. Send a provisioning marker and verify its exact Kafka event and warm receipt.
-10. Compare desired state with PostgreSQL catalogs, publication membership, Kafka topic metadata, connector configuration, and warm schema.
-11. Change the generation from `provisioning` to `ready` only when every check passes.
-
-Example business-leaf creation:
+Ordering rationale: with auto-topic-creation disabled, a record produced for a missing topic
+stops the **single shared connector for the whole cell** (`errors.tolerance=none`). Attaching
+last means no write — canary, bug, or human — can reach CDC before its topic exists.
 
 ```sql
 BEGIN;
@@ -343,20 +325,22 @@ CREATE TABLE public.orders_p_2026_08_05_00
 
 ALTER TABLE public.orders_p_2026_08_05_00
     ADD CONSTRAINT orders_p_2026_08_05_00_bound
-    CHECK (
-        created_at >= TIMESTAMPTZ '2026-08-05 00:00:00+00'
-        AND created_at < TIMESTAMPTZ '2026-08-05 12:00:00+00'
-    );
+    CHECK (created_at >= TIMESTAMPTZ '2026-08-05 00:00:00+00'
+       AND created_at <  TIMESTAMPTZ '2026-08-05 12:00:00+00');
 
-ALTER TABLE public.orders
-    ATTACH PARTITION public.orders_p_2026_08_05_00
-    FOR VALUES FROM ('2026-08-05 00:00:00+00')
-             TO   ('2026-08-05 12:00:00+00');
+-- LIKE does not copy triggers; the key-immutability trigger is part of the proof.
+CREATE TRIGGER orders_p_2026_08_05_00_key_guard
+    BEFORE UPDATE ON public.orders_p_2026_08_05_00
+    FOR EACH ROW
+    WHEN (OLD.id IS DISTINCT FROM NEW.id
+       OR OLD.created_at IS DISTINCT FROM NEW.created_at)
+    EXECUTE FUNCTION public.reject_record_key_change();
 
 COMMIT;
 ```
 
-Creating the matching marker table and adding it to the publication can also be transactional:
+Marker table (created and published transactionally; no connector change needed because the
+stable include regex already matches it — the canary proves discovery):
 
 ```sql
 BEGIN;
@@ -383,432 +367,293 @@ ALTER PUBLICATION cell01_hotwarm_cdc
 COMMIT;
 ```
 
-Adding the marker table to the publication does not require a Debezium configuration change when the stable include regex already matches it. The provisioning marker confirms that the running connector has discovered the new relation.
+The leaf must be empty when CDC coverage starts. Existing rows are never emitted just because a
+table joins a publication — adopting this system on a cell with historical data requires a
+separate, controlled snapshot/backfill step, owned by the rollout plan.
 
-The new business leaf must be empty when CDC coverage becomes active and before application routing opens. Existing rows are not automatically emitted merely because a table is attached or added to a publication. A non-empty leaf requires a separate controlled snapshot or backfill process.
+### Phase B: open and operate
 
-### Phase B: open and operate the generation
-
-The control service changes `ready -> active` using a compare-and-set transition. Only then may the application route traffic into it.
-
-At the start of an API-style batch:
+`ready → active` is a compare-and-set; only then does the application route traffic in.
+Per API-style batch:
 
 ```text
 route = read_route(cell, timeslot)
-
-hot_primary  -> execute the batch against hot PostgreSQL
-warm_primary -> execute the batch against warm PostgreSQL
-parked       -> reject with a retryable response or place in an approved durable retry path
+hot_primary  -> execute against hot
+warm_primary -> execute against warm
+parked       -> retryable reject (or approved durable retry path)
 ```
 
-Variant H performs this route/state check once per API batch, not before every table operation. Later table operations do not carry the ownership epoch.
+The route is read **once per batch**; later operations commit separately without rereading it.
+Partial batch completion is therefore possible when a later operation loses the detach race —
+production APIs need stable idempotency keys and explicit retry behavior. An API that requires
+whole-batch atomicity must use one hot transaction instead and be separately tested against
+detach locking; that is a different contract from this benchmarked design.
 
-The prototype models each selected-table operation as a separate PostgreSQL transaction. Therefore, partial completion is possible if an earlier operation commits and a later operation loses the detach race. Production APIs using this model require stable operation idempotency keys and explicit retry/error behavior.
+Applications write only through partitioned parents (never directly to leaves), there is no
+default partition that could swallow a stale retiring write, and a stale route fails closed.
+Read routing follows the same route store; when reads switch to warm is a product decision
+outside this guide, but it must key off the same authoritative route.
 
-If a real API requires all table operations to commit atomically, it must execute them in one hot PostgreSQL transaction and must be separately tested against detach locking. That is a different foreground transaction contract and must not be assumed from the current Variant H benchmark.
+## 7. The Variant H flip (the latency-sensitive path)
 
-Applications must write through partitioned parents, not directly into leaf tables. There must be no default partition capable of silently accepting a retiring-timeslot write after detach. A stale hot route must fail closed and retry routing rather than place data in an unintended partition.
+```mermaid
+sequenceDiagram
+    participant App as Business API
+    participant C as Flip coordinator
+    participant H as Hot PostgreSQL
+    participant K as Debezium + Kafka
+    participant S as Marker-aware sink
+    participant W as Warm PostgreSQL
 
-## 7. Detailed Variant H flip flow
-
-Only this section is on the latency-sensitive ownership path.
-
-### Step 1: preflight
-
-The coordinator verifies:
-
-- exactly one flip is allowed for the cell/timeslot;
-- the retiring generation manifest is complete;
-- every expected leaf is currently attached to the correct parent;
-- every leaf topic exists with exactly one partition;
-- the one source connector and its task are running;
-- the marker-aware warm sink and its tasks are running;
-- publication membership and stable connector rules cover every business leaf and marker table;
-- warm target tables and the receipt table are writable;
-- replication-slot retained WAL, connector queue usage, Kafka health, and sink lag are inside admission limits;
-- the remaining deadline includes both a forward budget and a recovery reserve.
-
-Low lag is an admission condition, not the final completion proof.
-
-### Step 2: create a durable attempt
-
-The coordinator creates:
-
-- one unique `attempt_id`;
-- one increasing `attempt_epoch`;
-- one ownership epoch for control-plane compare-and-set transitions;
-- one unique marker ID per retiring leaf;
-- one expected topic-partition per marker;
-- per-leaf state rows initially marked `attached`.
-
-This information is committed before any detach starts. A restarted coordinator can inspect and resume or recover the exact attempt.
-
-### Step 3: park retiring admission
-
-The coordinator atomically changes the retiring route/gate:
-
-```text
-hot_primary/open -> parked
+    C->>C: 1 preflight checks
+    C->>W: 2 create durable attempt (IDs, epochs, marker intents)
+    C->>H: 3 park retiring route
+    App-->>App: retiring batches get retryable rejects
+    C->>H: 4 per parent, in parallel - BEGIN, DETACH leaf, INSERT marker, COMMIT
+    H->>K: 5 connector emits each marker after that leaf's records
+    C->>K: 6 observe every exact marker offset (read_committed)
+    K->>S: business records, then marker
+    S->>W: 7 commit rows + receipt in one transaction
+    C->>W: 7 verify every exact receipt
+    C->>H: 8 verify catalog - every leaf detached
+    C->>W: 9 CAS parked -> drained -> warm_primary
 ```
 
-New retiring API batches now receive a retryable response. Active timeslots continue through their own routes.
+**Step 1 — preflight.** Single flip per cell/timeslot; manifest complete; every leaf attached
+to the right parent; every topic exists with one partition; connector, sink, publication
+membership, and warm tables verified; slot-retained WAL, connector queue, Kafka health, and
+sink lag inside admission limits; deadline includes a forward budget plus a recovery reserve.
+Low lag is an admission condition, never the completion proof.
 
-Work already admitted before the state change can behave in two ways:
+**Step 2 — durable attempt.** Unique `attempt_id`, increasing `attempt_epoch`, ownership
+epoch, one marker ID and expected topic-partition per leaf, per-leaf state rows — all committed
+before any detach, so a restarted coordinator can resume or recover the exact attempt.
 
-- a PostgreSQL transaction already using the parent finishes before detach obtains its lock;
-- an admitted operation that reaches PostgreSQL after detach fails because the matching partition is no longer attached.
+**Step 3 — park.** Atomic route change `hot_primary → parked`. New retiring batches get
+retryable rejects; active timeslots continue. Already-admitted work either commits before
+detach takes its lock, or fails afterward because the leaf is gone — the application's agreed
+retry behavior handles the second case.
 
-The application handles the second case through its agreed retry/error behavior. The control service cancels work still waiting in its own retiring queue, but it does not pretend that externally admitted requests disappeared.
-
-### Step 4: detach and mark every leaf in parallel
-
-The coordinator opens one bounded PostgreSQL connection per retiring parent/leaf. Each worker executes:
+**Step 4 — parallel atomic detach + marker.** One bounded connection per retiring parent:
 
 ```sql
 BEGIN;
+SET LOCAL lock_timeout = '250ms';
 
 ALTER TABLE public.orders
-DETACH PARTITION public.orders_p_2026_08_05_00;
+    DETACH PARTITION public.orders_p_2026_08_05_00;
 
-INSERT INTO flip_control.orders_p_2026_08_05_00 (
-    marker_schema_version,
-    marker_id,
-    attempt_id,
-    attempt_epoch,
-    ownership_epoch,
-    cell,
-    timeslot,
-    parent_name,
-    leaf_name
-) VALUES (
-    1,
-    :marker_id,
-    :attempt_id,
-    :attempt_epoch,
-    :ownership_epoch,
-    :cell,
-    :timeslot,
-    'orders',
-    'orders_p_2026_08_05_00'
-);
+INSERT INTO flip_control.orders_p_2026_08_05_00
+    (marker_schema_version, marker_id, attempt_id, attempt_epoch,
+     ownership_epoch, cell, timeslot, parent_name, leaf_name)
+VALUES
+    (1, :marker_id, :attempt_id, :attempt_epoch,
+     :ownership_epoch, :cell, :timeslot, 'orders', 'orders_p_2026_08_05_00');
 
 COMMIT;
 ```
 
-This uses `DETACH PARTITION` without `CONCURRENTLY` because detach and marker must commit in the same transaction. The command takes a strong lock on that parent and waits for conflicting work. Parallelism is safe only because each retiring leaf belongs to a different parent table.
+Plain `DETACH` (not `CONCURRENTLY`, which cannot run in a transaction block) is required so
+detach and marker commit atomically: commit means both exist, rollback means neither.
+Parallelism is safe because each leaf has a different parent. No grant is possible until every
+worker succeeds.
 
-For each leaf:
+What the `ACCESS EXCLUSIVE` parent lock actually costs, measured (PostgreSQL 17, 5M-row /
+1.6 GiB leaf, transaction includes the marker insert):
 
-- commit means both detach and marker exist;
-- rollback means neither exists;
-- the marker is inserted into its separate private marker table, not the detached business leaf;
-- no warm grant is possible until all leaf workers report success.
+| Component | Measured | Meaning |
+|---|---|---|
+| **Hold time** (lock acquired → commit) | 0.2–5.8 ms, idle or under ~23k TPS of parent-routed inserts | Catalog-only; independent of partition size — writers never notice |
+| **Wait time** (queueing for the lock) | Unbounded by default; behind one 8 s query, an innocent INSERT queued 5.6 s behind the waiting detach | The real risk: everything on that parent queues behind the waiting `ACCESS EXCLUSIVE` |
 
-Connection count and lock time must be bounded. For a large table count, production may use tested waves instead of unlimited parallelism, but the chosen wave size must preserve the all-leaf success/recovery rules.
+The rule that follows: **every detach worker runs with a short `lock_timeout`** (measured:
+a blocked detach aborts cleanly in ~253 ms at 250 ms), and timeout is a terminal worker
+failure → the attempt reverts and retries later instead of holding the parent's lock queue
+hostage. Worst case for the active lane per attempt is then roughly `lock_timeout` of added
+wait. Long-running transactions on partitioned parents are the one genuine enemy: forbid or
+reschedule them around flip windows and alert on `pg_locks` waiters during the detach stage.
+For very large table counts, bounded waves are acceptable as long as all-leaf
+success/recovery semantics are preserved.
 
-### Step 5: one Debezium connector publishes the markers
+**Step 5 — one connector publishes the markers.** WAL order guarantees each leaf's earlier
+committed changes decode before its marker; the SMT routes the marker into the same
+one-partition topic; Kafka appends it after the preceding leaf records. Active-lane records
+ahead of the marker in the shared connector queue can add latency but can never create a false
+proof — that latency coupling is the accepted cost of the single-connector design.
 
-The same source connector that handles active and retiring business changes reads the committed marker inserts.
+**Step 6 — observe exact markers.** A `read_committed` observer verifies, per leaf: topic and
+partition 0, header and schema version, marker ID, attempt ID + epoch, ownership epoch, cell,
+timeslot, parent, leaf, and source table — then records the exact offset as evidence. Markers
+from older attempts are rejected.
 
-The ordering argument for one leaf is:
+**Step 7 — ordered warm receipts.** The coordinator polls warm until every expected receipt
+matches its durable marker intent, under the Section 5.4 contract. Consumer lag is never
+accepted as a substitute.
 
-1. Parking stops new application admission.
-2. Blocking detach waits for conflicting transactions already using that parent.
-3. The detach and marker commit together.
-4. Earlier committed business changes appear before that marker in logical decoding order.
-5. The source SMT routes the marker into the same one-partition leaf topic.
-6. Kafka appends the marker after the preceding leaf records.
+**Step 8 — catalog verification.** Every expected leaf is confirmed detached from its exact
+parent, with no unexpected state; final per-leaf evidence is journaled.
 
-Active-table changes may be ahead of the marker inside the single connector's queue. That can increase latency, but it cannot make a false marker proof. This is the main performance risk accepted by the single-connector design.
+**Step 9 — grant.** Exact CAS `parked → drained → warm_primary` for this attempt and epoch
+only. New batches route warm; stale hot routes fail closed (the leaf is detached); active
+timeslots continue on hot; evidence is saved immediately; reconciliation runs outside
+writer-park time.
 
-### Step 6: observe every exact Kafka marker
-
-The coordinator uses a `read_committed` Kafka observer. For each leaf it verifies:
-
-- expected topic and partition `0`;
-- marker header and schema version;
-- marker ID;
-- attempt ID and attempt epoch;
-- ownership epoch;
-- cell and timeslot;
-- parent name and leaf name;
-- source schema and source marker table.
-
-The coordinator records the marker's exact Kafka offset as durable evidence. It does not accept a marker from an older attempt or another leaf.
-
-### Step 7: wait for ordered warm receipts
-
-The marker-aware sink reads the marker from the leaf topic. It makes the receipt visible only after all earlier records from that topic-partition are durable, following the Section 5.4 contract.
-
-The coordinator queries warm PostgreSQL until every expected receipt matches the durable marker intent. A low Kafka consumer-lag number is insufficient: every exact leaf receipt must exist and each receipt must come from the verified ordered sink path.
-
-### Step 8: verify detached catalog state
-
-Before granting ownership, the coordinator checks hot PostgreSQL catalogs and confirms that every expected business leaf is detached from its exact parent.
-
-It also confirms that no unexpected leaf or table-state transition is present. The durable attempt journal is updated with the final per-leaf evidence.
-
-### Step 9: grant warm ownership
-
-The coordinator performs exact compare-and-set transitions for the current attempt:
-
-```text
-parked -> drained -> warm_primary
-```
-
-The transition succeeds only for the expected attempt and ownership epoch. This prevents a delayed coordinator or old retry from granting a later generation.
-
-After `warm_primary` commits:
-
-- new application batches route to warm PostgreSQL;
-- stale hot routes fail because the old leaf is detached;
-- active timeslots continue on hot;
-- the ownership-grant evidence is saved immediately;
-- reconciliation starts outside writer-park time.
-
-## 8. Failure and recovery flow
+## 8. Failure and recovery
 
 Failure always means **do not grant warm ownership**.
 
-### One or more parallel workers fail
+| Failure | Response |
+|---|---|
+| Any detach worker fails or hits `lock_timeout` | Stay parked; wait for every worker's terminal result; inspect catalogs (never trust client errors alone); reattach every leaf that actually detached; verify each in the catalog; CAS ownership back to hot; reopen admission only after verification |
+| Ambiguous DDL timeout | A timeout does not prove rollback — check `pg_inherits` and the marker table to learn whether detach-marker committed, then reattach or continue accordingly |
+| Coordinator crash mid-flip | The new leader loads the durable attempt, inspects catalogs, markers, and receipts, and resumes or reverts. It never creates a new attempt before resolving the old one |
+| Debezium, Kafka, or sink unavailable | Stay parked while the forward budget allows; revert at the recovery reserve. The slot retains WAL meanwhile — retained-WAL bytes and hot disk headroom need hard alerts |
+| Reattach fails | Stay parked and page an operator. Never reopen hot with partial reattachment. Expose exact leaves, catalog state, lock blockers, and the repair command |
 
-1. Keep the route parked.
-2. Wait until every detach worker has a terminal result.
-3. Inspect PostgreSQL catalogs instead of trusting only client errors.
-4. Reattach every leaf that actually detached.
-5. Verify every expected leaf is attached to its original parent.
-6. Mark the attempt reverted/failed.
-7. Change ownership back to hot using the exact attempt/epoch transition.
-8. Reopen retiring admission only after catalog verification succeeds.
-
-Markers from successful leaf transactions may later reach Kafka and warm. They remain harmless because they carry the failed attempt's unique identity. The ownership compare-and-set must never accept them for another attempt.
-
-### Coordinator crashes after detach-marker commit
-
-On restart, the new leader loads the durable attempt, inspects actual catalog state, searches for the same exact Kafka markers and warm receipts, and either resumes the proof or recovers to hot. It must not create a new attempt before resolving the old one.
-
-### Debezium, Kafka, or sink is unavailable
-
-The route remains parked while the forward deadline allows. If the deadline reaches the recovery reserve, the coordinator recovers to hot.
-
-The single replication slot retains required WAL while Debezium is unavailable. Retained WAL bytes and hot-database disk headroom therefore need hard alerts and operational limits.
-
-### Ambiguous DDL timeout
-
-A timeout does not prove rollback. The coordinator checks `pg_inherits` and the marker table to determine whether detach-marker committed before deciding to reattach or continue.
-
-### Reattach fails
-
-Keep the route parked and page an operator. Never reopen hot while only some parents are reattached. The control plane must expose the exact leaves, catalog state, lock blockers, and repair command.
+Markers already emitted by a failed attempt are harmless: they carry that attempt's unique
+identity, and the ownership CAS can never accept them for another attempt.
 
 ## 9. After the grant: reconciliation and delayed cleanup
 
-Do not drop detached hot tables or Kafka topics during the flip.
+**`warm_primary` is the point of no return.** Once new writes land on warm, there is no
+supported automatic return to hot — that would require reverse CDC. The preserved hot tables
+and Kafka history below exist for *verification, forensics, and replay*, not rollback.
+Everything reversible happens before the grant; that is why the proof is fail-closed.
 
-After warm becomes primary:
+After the grant: compare per-leaf counts and checksums, verify warm indexes/constraints,
+confirm no unexpected hot writes occurred, preserve the detached hot tables and Kafka history
+for the retention window, verify backups, then mark `cleanup_eligible`.
 
-1. Compare counts and business checksums per leaf.
-2. Verify important indexes and constraints on warm.
-3. Confirm no unexpected hot writes or direct leaf access occurred.
-4. Preserve the detached hot tables for the rollback/replay period.
-5. Preserve Kafka history for the required replay period.
-6. Verify backups and restore procedures.
-7. Mark the generation `cleanup_eligible` only after all policies pass.
+Cleanup is a separate audited workflow: confirm the route is still `warm_primary`, retention
+deadlines passed, and nothing needs the data; remove marker tables from the publication; `DROP
+TABLE` the detached leaves (they are standalone tables now) and their marker tables; delete or
+expire topics per policy; mark `cleaned`, keeping audit metadata forever. Do not reuse topic
+names quickly — deletion is asynchronous and old consumer offsets may linger.
 
-Cleanup is a separate audited workflow:
+## 10. What changes per generation?
 
-1. Confirm the route is still `warm_primary`.
-2. Confirm the rollback and retention deadlines have passed.
-3. Confirm no repair, replay, consumer, or legal-retention process needs the data.
-4. Remove each old marker table from the publication.
-5. Drop the detached hot business tables.
-6. Drop their private marker tables.
-7. Delete or expire Kafka topics according to policy.
-8. Mark the generation `cleaned` while keeping permanent audit metadata.
-
-After detach, the old business leaf is a standalone PostgreSQL table. It is removed with `DROP TABLE`, not a partition-specific drop command. Topic names must not be quickly reused because deletion is asynchronous and old consumer offsets may still exist.
-
-## 10. What changes for every generation?
-
-| Component | Required action | Restart? |
+| Component | Action | Restart? |
 |---|---|---:|
-| Hot business tables | Create and attach one new leaf per registered parent | No |
-| Marker tables | Create one marker table per business leaf | No |
-| Publication | Add the new marker tables; business parents stay published | No |
-| Debezium source connector | Verify its stable regex and SMT rules match | Normally no |
-| Logical slot | Reuse the same slot | No |
-| Kafka | Create one one-partition topic per business leaf | No |
-| Warm sink | Verify stable topic and table-routing rules | Normally no |
-| Warm PostgreSQL | Create/attach destination leaves if warm is partitioned | No |
-| Application route | Open only after the generation is `ready` | No |
+| Hot business tables | Create + attach one leaf per parent (with trigger) | No |
+| Marker tables | Create one per leaf; add to publication | No |
+| Kafka | Create one one-partition topic per leaf | No |
+| Debezium connector / slot | Nothing — stable regex + same slot | No |
+| Warm sink / warm tables | Verify routing; create destination leaves if warm is partitioned | No |
+| Application route | Open only after `ready` | No |
 
-If a new business parent table is introduced, that is a schema deployment rather than an ordinary generation rotation. The publication, allowlist, connector routing, sink mapping, warm schema, tests, and consumer contracts may all require a controlled update.
+Introducing a **new business parent** is a schema deployment, not a rotation: publication,
+allowlist, connector routing, sink mapping, warm schema, and consumer contracts all change
+under control.
 
 ## 11. Required safety rules
 
-- No direct application writes to leaf tables.
-- No default partition that can hide a stale retiring write.
-- One Kafka partition per leaf topic.
-- One marker table per business leaf and generation.
-- Marker table names and topic names come only from a validated manifest.
-- Marker headers alone are not trusted; the complete marker payload is checked.
-- Business operations have stable idempotency keys.
-- A receipt cannot become visible before all preceding records from its Kafka partition are durable.
-- Sink writes and Kafka progress acknowledgement are transactionally ordered.
-- Connector/sink errors stop the flip; records are never silently skipped.
-- Only one coordinator owns a cell/timeslot attempt at a time.
-- All state transitions use compare-and-set conditions.
-- Recovery uses observed PostgreSQL catalog state.
-- Cleanup is delayed, audited, and retry-safe.
-- Credentials are stored in a secret manager; PostgreSQL, Kafka, Connect, and control APIs use TLS and least privilege.
+- No direct application writes to leaf tables; no default partition.
+- Key-immutability trigger on every leaf (row movement would silently diverge warm).
+- One Kafka partition per leaf topic; topics created before their leaf is attached.
+- Every detach worker uses a short `lock_timeout`; timeout ⇒ revert, never wait.
+- Marker names/topics come only from the validated manifest; full marker payload is verified,
+  never the header alone.
+- Business operations carry stable idempotency keys.
+- A receipt is never visible before all preceding records of its partition are durable; sink
+  writes and Kafka acknowledgement are transactionally ordered.
+- Connector/sink errors stop the flip; records are never skipped.
+- One coordinator per cell/timeslot attempt; every transition is a compare-and-set; recovery
+  trusts observed catalog state.
+- Failover-synchronized replication slots on hot (PostgreSQL 17+).
+- Cleanup is delayed, audited, retry-safe. Secrets in a secret manager; TLS and least
+  privilege everywhere.
 
 ## 12. Metrics and alerts
 
-### Writer-park breakdown
+- **Writer-park breakdown:** park time; longest per-leaf lock wait; longest detach-marker
+  transaction; all-leaf parallel wall time; marker commit → Kafka observation; observation →
+  warm receipt; verification + grant time; recovery/reattach time.
+- **Single-source health:** connector task state and restarts; source queue usage; source lag
+  percentiles; **slot retained-WAL bytes**; hot disk headroom; Kafka produce latency/ISR;
+  per-leaf sink lag and commit latency; missing/old receipts.
+- **Application impact:** achieved TPS per lane; active p95/p99 during detach; rejects while
+  parked; detach-race errors; retry success and duplicate-prevention counts; partial-batch
+  count.
 
-- route/gate park time;
-- longest per-leaf lock wait;
-- longest per-leaf detach-marker transaction;
-- all-leaf parallel wall time;
-- hot marker commit to Kafka observation;
-- Kafka observation to warm receipt;
-- catalog verification and ownership-grant time;
-- total park time;
-- recovery and reattach time.
+The single most important measurement is **hot marker commit → Kafka observation at peak
+active traffic**: it directly shows whether the shared connector's head-of-line delay is
+acceptable.
 
-### Single-source health
+## 13. Implementation plan
 
-- Debezium task state and restart count;
-- source queue records and bytes versus maximum;
-- source lag p50/p95/p99;
-- replication slot retained WAL bytes;
-- hot PostgreSQL disk headroom;
-- Kafka produce latency, retries, ISR, and under-replicated partitions;
-- per-leaf sink lag and JDBC commit latency;
-- missing or old marker receipts.
-
-### Application impact
-
-- active and retiring achieved TPS;
-- active API p95/p99 latency during detach;
-- retiring requests rejected while parked;
-- detach-race database errors;
-- retry success and duplicate-prevention counts;
-- partial API-batch completion count.
-
-The most important single-connector measurement is **hot marker commit to Kafka observation at peak active traffic**. It shows whether active events create unacceptable head-of-line delay inside the one source task.
-
-## 13. Production implementation plan
-
-### Stage 1: make the prototype support H with shared source
-
-- Remove the H-to-isolated-only matrix, coordinator, API, and UI restrictions.
-- Run H with the existing shared source definition.
-- Preserve the exact marker validation and warm receipt proof.
-- Add matched H tests at normal, peak, and burst traffic.
-- Compare marker latency and active API impact against the existing isolated H evidence.
-
-### Stage 2: implement rolling generation discovery
-
-- Replace exact leaf lists with validated generation-independent source and sink regexes.
-- Publish stable business parents once.
-- Add new marker tables transactionally to the existing publication.
-- Add provisioning canaries that prove discovery without connector restart.
-- Test connector restart after several generations exist.
-
-### Stage 3: build the lifecycle reconciler
-
-- Implement the durable generation and attempt state machines.
-- Add desired-versus-observed checks for PostgreSQL, publication, Kafka, Connect, and warm schema.
-- Make every provisioning and cleanup action idempotent.
-- Add leader election and per-cell/timeslot locking.
-- Add operator-visible repair instructions.
-
-### Stage 4: production hardening
-
-- Add authentication, authorization, TLS, secret management, audit, and rate limits.
-- Add slot-WAL limits, disk alerts, connector queue alerts, and topic-retention controls.
-- Validate marker/business schema compatibility with every consumer.
-- Implement and crash-test the marker-aware sink transaction, or enable the conservative exact sink-offset fallback.
-- Test database failover, connector restart, Kafka outage, sink outage, and coordinator crash.
-- Run recovery drills for every partial-detach combination.
-
-### Stage 5: rollout
-
-1. Deploy schema and connector rules without changing ownership.
-2. Run provisioning canaries.
-3. Run shadow flips that prove markers but do not grant ownership.
-4. Enable one low-risk canary cell.
-5. Validate correctness, marker latency, active impact, WAL growth, and recovery.
-6. Increase rollout gradually with automatic stop conditions.
+1. **Prototype: enable H on the shared source.** *Implemented as variant `H-Prod`*: the
+   parallel marker proof now accepts the shared topology
+   ([flip.py](../src/flipbench/flip.py), [playground_api.py](../src/flipbench/playground_api.py)),
+   `H-Prod` is a first-class benchmark variant
+   ([matrix.py](../src/flipbench/matrix.py), [benchmark_plan.py](../src/flipbench/benchmark_plan.py)),
+   and the playground offers it whenever the environment was created with
+   `SOURCE_TOPOLOGY=shared`. Run the matched comparison with
+   [`config/benchmark-plans/h-vs-h-prod-3000-5000-two-repetitions.json`](../config/benchmark-plans/h-vs-h-prod-3000-5000-two-repetitions.json)
+   — each case rebuilds the environment with its variant's own topology — then compare marker
+   latency and active impact. F and G stay isolated-only.
+2. **Rolling generation discovery.** Replace exact leaf lists with registry-generated regexes;
+   provisioning canaries prove discovery without restart; test connector restart with many
+   generations present.
+3. **Lifecycle reconciler.** Durable generation/attempt state machines; desired-vs-observed
+   checks; idempotent provisioning and cleanup; leader election and per-cell locking;
+   operator-visible repair guidance.
+4. **Hardening.** AuthN/Z, TLS, secrets, audit; slot-WAL and disk alerts; schema-strategy
+   validation with every consumer; implement and crash-test the marker-aware sink (or enable
+   the sink-offset fallback); test failover (including slot synchronization), connector
+   restart, Kafka/sink outage, coordinator crash; drill every partial-detach combination.
+5. **Rollout.** Deploy schema + connector rules with no ownership change → provisioning
+   canaries → shadow flips (prove markers, grant nothing) → one low-risk canary cell →
+   gradual rollout with automatic stop conditions.
 
 ## 14. Acceptance criteria
 
-Do not call the design production-ready until:
+Not production-ready until:
 
 - no test grants warm without every exact marker receipt;
-- no test can observe a marker receipt before preceding business records are durable;
-- all partial detach failures recover every leaf to hot;
-- a newly created generation works without source-connector reconfiguration or restart;
-- one source connector meets marker-latency p99 at expected peak and burst traffic;
-- active API latency remains inside its SLO during parallel detach;
-- replication-slot WAL remains bounded during tested outages;
-- marker redelivery is idempotent;
-- every Kafka consumer safely handles or filters marker records;
+- no test observes a receipt before its preceding business records are durable;
+- every partial-detach combination recovers all leaves to hot;
+- a new generation works with zero connector reconfiguration or restart;
+- marker-latency p99 meets its SLO at peak and burst on the one connector;
+- active API latency stays inside its SLO during the parallel detach (with `lock_timeout`
+  enforced);
+- slot WAL stays bounded through tested outages, and **slot failover has been drilled**;
+- marker redelivery is idempotent and every consumer handles or filters markers;
 - routing fails closed when stale;
-- backup, replay, reconciliation, and cleanup procedures have been exercised;
-- on-call operators can diagnose and recover a stuck attempt from durable evidence.
+- backup, replay, reconciliation, and cleanup have been exercised;
+- on-call can diagnose and recover a stuck attempt from durable evidence alone.
 
-If the shared source misses its marker-latency SLO, the first response should be capacity and queue tuning backed by measurements. A separate migration connector remains a later fallback, but it is intentionally outside the selected design in this document.
+If the shared source misses its marker-latency SLO, tune capacity and queues first, with
+measurements. A separate migration connector remains a documented fallback, deliberately
+outside this design.
 
-## 15. Current prototype versus the production guide
+## 15. Prototype versus production
 
-| Area | Current prototype | Required production form |
+| Area | Prototype today | Production form |
 |---|---|---|
-| H source topology | H is selectable only with isolated active/migration connectors | H uses one shared source connector |
-| Capture lists | Exact current active/retiring leaf names | Stable allowlisted generation patterns |
-| Partition lifecycle | Fixed setup/reset creates two generations | Durable rolling provision/open/retire/cleanup reconciler |
-| Warm proof | Generic JDBC sink plus exact receipt in the prototype | Verified marker-aware atomic receipt contract or conservative sink-offset fallback |
-| Security | Trusted local environment | Authenticated, encrypted, least-privilege control plane |
-| Hosts | Single local machine | Independent failure domains and production storage/networking |
-| Failure testing | Core recovery and integration tests | Systematic crash, outage, failover, replay, and operator drills |
-| Results | Comparative local evidence | Production SLOs and alerts based on repeated canary measurements |
+| H source topology | Isolated connectors only (guarded) | One shared source connector |
+| Capture lists | Exact leaf names | Registry-generated stable patterns |
+| Partition lifecycle | Fixed two-generation setup/reset | Rolling provision/open/retire/cleanup reconciler |
+| Warm proof | Generic JDBC sink + exact receipt | Marker-aware atomic receipt sink, or sink-offset fallback |
+| Slot failover | Single local instance | PG17+ failover-synchronized slots |
+| Security | Trusted loopback | Authenticated, encrypted, least privilege |
+| Failure testing | Core recovery + integration tests | Systematic crash/outage/failover/operator drills |
 
-Useful code anchors:
+Code anchors: [`connector_configs.py`](../src/flipbench/connector_configs.py) (source/sink
+routing and marker SMTs), [`postgres_io.py`](../src/flipbench/postgres_io.py) (atomic
+detach-marker transaction), [`flip.py`](../src/flipbench/flip.py) (H coordination, evidence,
+grant, failure path), [`kafka_io.py`](../src/flipbench/kafka_io.py) (exact marker
+observation), [`recovery.py`](../src/flipbench/recovery.py) (catalog-driven reattachment).
 
-- [`connector_configs.py`](../src/flipbench/connector_configs.py) — shared/isolated source definitions and source/sink routing.
-- [`postgres_io.py`](../src/flipbench/postgres_io.py) — marker tables and atomic detach-marker transaction.
-- [`flip.py`](../src/flipbench/flip.py) — parallel H coordination, evidence, grant, and failure path.
-- [`kafka_io.py`](../src/flipbench/kafka_io.py) — exact Kafka marker observation.
-- [`recovery.py`](../src/flipbench/recovery.py) — catalog-driven reattachment.
-- [`matrix.py`](../src/flipbench/matrix.py) — current isolated-topology restriction for H.
+## 16. References
 
-## 16. Final flow in one table
-
-| Order | When | Control service action | Result |
-|---:|---|---|---|
-| 1 | Well before traffic | Create hot/warm leaves, marker tables, and Kafka topics | Physical generation exists |
-| 2 | Before traffic | Add marker tables to the one publication | One source connector can see them |
-| 3 | Before traffic | Run exact routing and receipt canaries | Generation becomes `ready` |
-| 4 | Timeslot opens | CAS `ready -> active` | APIs write hot after one route check |
-| 5 | Retirement starts | Create attempt and park retiring route | New retiring batches stop |
-| 6 | Critical path | Parallel atomic detach-marker transactions | Every old leaf is closed with a terminal marker |
-| 7 | Critical path | One Debezium connector routes markers into leaf topics | Kafka has exact per-leaf completion evidence |
-| 8 | Critical path | Marker-aware sink atomically commits preceding rows and exact receipts | Warm confirms every stream passed its marker |
-| 9 | Critical path | Verify catalogs and CAS to `warm_primary` | New operations route warm |
-| 10 | After grant | Reconcile and preserve recovery evidence | Ownership is validated without extending park time |
-| 11 | After retention | Remove publication entries, old tables, marker tables, and topics | Generation becomes `cleaned` |
-
-## 17. Official technical references
-
-- [PostgreSQL: CREATE PUBLICATION](https://www.postgresql.org/docs/17/sql-createpublication.html) — partitioned-parent coverage, future partitions, leaf identity, and the fact that DDL is not published.
-- [PostgreSQL: ALTER PUBLICATION](https://www.postgresql.org/docs/17/sql-alterpublication.html) — dynamically adding and removing marker tables and the required privileges.
-- [PostgreSQL: Logical replication restrictions](https://www.postgresql.org/docs/17/logical-replication-restrictions.html) — schema and DDL changes must be managed separately.
+- [PostgreSQL: CREATE PUBLICATION](https://www.postgresql.org/docs/17/sql-createpublication.html) — partitioned-parent coverage and leaf identity.
+- [PostgreSQL: ALTER PUBLICATION](https://www.postgresql.org/docs/17/sql-alterpublication.html) — adding/removing marker tables.
 - [PostgreSQL: ALTER TABLE](https://www.postgresql.org/docs/17/sql-altertable.html) — detach behavior and locking.
-- [PostgreSQL: Table partitioning](https://www.postgresql.org/docs/current/ddl-partitioning.html) — create/attach/detach lifecycle and lock-reduction techniques.
-- [Debezium PostgreSQL connector](https://debezium.io/documentation/reference/stable/connectors/postgresql.html) — one-task behavior, publication/slot configuration, anchored include rules, source metrics, and recovery behavior.
-- [Debezium JDBC sink connector](https://debezium.io/documentation/reference/connectors/jdbc.html) — at-least-once delivery, idempotent upserts, batching, tasks, and sink configuration; production still needs the stronger receipt-ordering contract defined here.
-- [Debezium topic routing](https://debezium.io/documentation/reference/3.6/transformations/topic-routing.html) — predicate-based topic routing and schema compatibility.
-- [Kafka topic operations](https://kafka.apache.org/43/operations/basic-kafka-operations/) — explicit topic and partition management.
-- [Kafka topic configuration](https://kafka.apache.org/43/configuration/topic-configs/) — replication, ISR, retention, and durability settings.
-- [Kafka Connect configuration](https://kafka.apache.org/43/configuration/kafka-connect-configs/) — worker and source exactly-once configuration.
+- [PostgreSQL: Table partitioning](https://www.postgresql.org/docs/current/ddl-partitioning.html) — attach/detach lifecycle and lock levels.
+- [PostgreSQL: Logical replication failover](https://www.postgresql.org/docs/17/logical-replication-failover.html) — failover-synchronized slots.
+- [PostgreSQL: Logical replication restrictions](https://www.postgresql.org/docs/17/logical-replication-restrictions.html) — DDL is not replicated.
+- [Debezium PostgreSQL connector](https://debezium.io/documentation/reference/stable/connectors/postgresql.html) — slot/publication config, anchored include lists, heartbeats.
+- [Debezium JDBC sink connector](https://debezium.io/documentation/reference/connectors/jdbc.html) — at-least-once delivery and idempotent upserts.
+- [Debezium topic routing](https://debezium.io/documentation/reference/3.6/transformations/topic-routing.html) — predicate-based routing.
+- [Kafka topic configuration](https://kafka.apache.org/43/configuration/topic-configs/) — replication, ISR, retention.
+- [Kafka Connect configuration](https://kafka.apache.org/43/configuration/kafka-connect-configs/) — worker exactly-once source support.

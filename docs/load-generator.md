@@ -221,12 +221,13 @@ The load shape is generic across A through H; only the foreground ownership guar
 
 | Variants | Load-generator ownership behavior |
 |---|---|
-| A, B, B+ | Before every table operation, acquire a shared advisory lock on warm, read `partition_tracker`, write and commit on hot, then release the warm lock. |
+| A | The first table operation in an API batch checks only the hot gate state. Later operations do not reread the gate; each operation still commits separately. |
+| B, B+ | Before every table operation, acquire a shared advisory lock on warm, read `partition_tracker`, write and commit on hot, then release the warm lock. |
 | D | Every table operation calls a restricted hot function that checks gate state and the exact ownership epoch under a shared row lock, performs one write, and commits. |
 | E, F, G | The first table operation in an API batch checks hot gate state and epoch. Later operations do not reread the gate; each operation still commits separately. |
-| H | The first table operation in an API batch checks only that the hot gate state is `open`. The load generator does not send or check an epoch. Later operations do not reread the gate, and each commits separately. |
+| H | Same foreground behavior as revised A: the first table operation checks only that the hot gate state is `open`; later operations make no gate read and commit separately. H differs in its exact-marker flip proof. |
 
-Variant H still uses an ownership epoch inside the flip coordinator. The epoch protects park, grant and recovery state transitions from stale flip attempts. It is simply removed from H's foreground application-style admission check.
+Variants A and H still use an ownership epoch inside the flip coordinator. The epoch protects park, grant and recovery state transitions from stale flip attempts. It is removed only from their foreground application-style admission check.
 
 The database functions also validate the selected timeslot, allowlisted parent table, timestamp range, row count and payload size. The application writer role cannot write directly to arbitrary tables; it can only execute the restricted functions or the explicitly allowed path for that variant.
 

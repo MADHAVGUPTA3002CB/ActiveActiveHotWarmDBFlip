@@ -4,7 +4,7 @@ Every variant moves the same retiring timeslot and must reach the same final inv
 
 | Variant | Source topology | Foreground write rule | Completion proof | Detach behavior |
 |---|---|---|---|---|
-| A | Shared | Original retiring park | LSN + sink offsets | Concurrent, serial |
+| A | Shared | Hot state-only admission once per API batch | LSN + sink offsets | Concurrent, serial |
 | B | Isolated | Original retiring park | LSN + sink offsets | Concurrent, serial |
 | B+ | Isolated | Original retiring park | LSN + sink offsets; immediate heartbeat | Concurrent, serial |
 | D | Isolated | Gate lock + epoch per table operation | LSN + sink offsets | Concurrent |
@@ -12,12 +12,14 @@ Every variant moves the same retiring timeslot and must reach the same final inv
 | F | Isolated | E foreground path | Exact per-leaf Kafka marker + warm receipt | Concurrent |
 | G | Isolated | E foreground path | Exact per-leaf marker + receipt | Atomic detach-marker, serial |
 | H | Isolated | State-only admission once per API batch | Exact per-leaf marker + receipt | Atomic detach-marker, parallel |
+| H-Prod | Shared (single connector) | State-only admission once per API batch | Exact per-leaf marker + receipt | Atomic detach-marker, parallel |
+| H-DD-Prod | Generation-pinned lanes (two persistent connectors) | State-only admission once per API batch | Exact per-leaf marker + receipt | Atomic detach-marker, parallel; rolling generations |
 
 ## A — Shared CDC baseline
 
-A uses one publication, logical replication slot, and Debezium source connector for both active and retiring leaves. The flip uses a PostgreSQL WAL fence and Kafka sink consumer offsets to prove that all retiring data reached warm.
+A uses one publication, logical replication slot, and Debezium source connector for both active and retiring leaves. Its foreground path now matches H-Prod: the first operation reads the hot gate state once for the whole API batch, later operations do not reread it, and each table operation commits separately. A still uses a PostgreSQL WAL fence and transaction-aware Kafka sink consumer offsets—not markers—to prove that all retiring data reached warm.
 
-Heavy active traffic can delay retiring progress inside the shared Debezium connector queue and Kafka emission path. This is the baseline against which source isolation is measured.
+Heavy active traffic can delay retiring progress inside the shared Debezium connector queue and Kafka emission path. This is the baseline against which source isolation and proof choice are measured. Results produced by the older warm-tracker form of A must be labeled as legacy and are not foreground-throughput comparable with the revised A.
 
 ## B — Isolated CDC with passive heartbeat
 
@@ -63,7 +65,54 @@ H runs G's exact per-leaf transaction concurrently, using one PostgreSQL connect
 
 All workers must finish successfully before marker observation begins. If any worker fails, ownership is not granted and catalog-driven recovery reattaches every leaf that committed successfully. Parallelism improves latency at the cost of a short burst of database connections and lock work.
 
-The prototype currently requires isolated active/migration sources when H is selected. H's exact-marker correctness proof does not fundamentally require that split. The [final Variant H production guide](variant-h-production-single-debezium.md) defines the selected one-source-connector implementation, rolling partition lifecycle, recovery, cleanup, and validation required for a real system. The [feasibility research](variant-h-production-feasibility.md) keeps the earlier topology comparison.
+The prototype currently requires isolated active/migration sources when H is selected. H's exact-marker correctness proof does not fundamentally require that split. The [single-source production guide](variant-h-production-single-debezium.md) defines the H-Prod lifecycle, while the [generation-pinned connector-lane design](variant-h-generation-pinned-connectors.md) proposes alternating persistent source lanes when a shared connector cannot meet the marker-latency SLO. The [feasibility research](variant-h-production-feasibility.md) keeps the earlier topology comparison.
+
+## H-Prod — H on the single shared source
+
+H-Prod runs exactly H's flip algorithm — state-only batch admission, parallel atomic
+detach-marker transactions, exact marker observation, and warm receipts — while one shared
+publication, slot, and Debezium source connector carries both active and retiring changes.
+
+This is the production topology candidate from the
+[single-Debezium implementation guide](variant-h-production-single-debezium.md): the marker
+proof never reads slot LSN, so removing the second connector does not weaken correctness. What
+changes is latency coupling: markers share the one connector's queue with active traffic, so
+marker emission inherits any active-lane source backlog present at flip time. Admission
+thresholds on source lag bound that cost.
+
+H-Prod requires an environment created with `SOURCE_TOPOLOGY=shared`. The serial marker
+variants F and G remain isolated-only.
+
+## H-DD-Prod — rolling generations on pinned connector lanes
+
+H-DD-Prod implements the full
+[generation-pinned connector-lane design](variant-h-generation-pinned-connectors.md) as a
+running system. `SOURCE_TOPOLOGY=lanes` creates two persistent Debezium connectors (lane A and
+lane B) with generation-independent regex capture patterns and one empty publication each. The
+rolling driver then repeats the complete lifecycle per 12-hour generation:
+
+1. **Provision** the next generation on the free lane: create the leaves (with the
+   key-immutability trigger and bound `CHECK`), private marker tables, one-partition Kafka
+   topics, publication membership, timeslot window, routes, gate, and warm tracker row — then
+   prove the whole CDC path with an exact canary marker and warm receipt, all without a
+   connector restart.
+2. **Rotate** at the boundary: the new generation becomes active on its lane while the previous
+   generation demotes to retiring on its original lane, which quiesces because the new active
+   traffic flows through the other connector.
+3. **Flip** the retiring generation with Variant H's parallel atomic detach-marker
+   transactions (`lock_timeout` protected), exact marker observation, warm receipts, the
+   conservative sink-offset gate, hot/warm row parity, and catalog verification before the
+   ownership compare-and-set.
+4. **Release** the lane for the generation after next.
+
+The hot admission layer is timeslot-window driven (`flipbench_guard.timeslot_windows`), so new
+generations are data, not schema changes. Run it with:
+
+```bash
+make up-rf3 SOURCE_TOPOLOGY=lanes
+make setup-rf3 SOURCE_TOPOLOGY=lanes TABLE_COUNT=5
+make h-dd-prod-rolling-rf3 SOURCE_TOPOLOGY=lanes GENERATIONS=3
+```
 
 ## How to choose a variant for a test
 
@@ -74,5 +123,9 @@ The prototype currently requires isolated active/migration sources when H is sel
 - Use F versus E to compare exact marker proof with LSN/offset proof.
 - Use G versus F to measure the cost/benefit of atomic detach-marker ordering.
 - Use H versus G to measure parallel detach scaling as table count increases.
+- Use H-Prod versus H to measure the single shared connector's marker-latency cost against the
+  isolated migration lane at matched traffic.
+- Use H-DD-Prod to validate the rolling production lifecycle: repeated provision/rotate/flip
+  cycles on generation-pinned lanes with no connector restarts.
 
 Do not compare variants from different table counts, traffic mixes, admission thresholds, Docker generations, or source topologies as if they were matched. Use the plan runner with repeated, randomized cases and preserve the raw run evidence.

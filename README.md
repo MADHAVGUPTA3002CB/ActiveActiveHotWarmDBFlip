@@ -26,7 +26,7 @@ flowchart LR
 
 The selected CDC layout uses `publish_via_partition_root=false`: every PostgreSQL leaf has its own Kafka topic and every leaf topic has exactly one Kafka partition. Active traffic continues while only the retiring timeslot is fenced, detached, drained, and granted to warm ownership.
 
-The prototype supports 5, 10, 15, or 20 partitioned tables and variants A through H. See [Architecture](docs/architecture.md), [Load generator](docs/load-generator.md), [Variant reference](docs/variants.md), [final Variant H production guide](docs/variant-h-production-single-debezium.md), and [Variant H feasibility research](docs/variant-h-production-feasibility.md) for the detailed flow, workload model, correctness contracts, selected single-source production design, and supporting research.
+The prototype supports 5, 10, 15, or 20 partitioned tables and variants A through H, plus H-Prod (H on the single shared source connector). See [Architecture](docs/architecture.md), [Load generator](docs/load-generator.md), [Variant reference](docs/variants.md), [single-source Variant H production guide](docs/variant-h-production-single-debezium.md), [generation-pinned connector-lane design](docs/variant-h-generation-pinned-connectors.md), and [Variant H feasibility research](docs/variant-h-production-feasibility.md) for the detailed flow, workload model, correctness contracts, production topology options, and supporting research.
 
 ## Prerequisites
 
@@ -121,7 +121,7 @@ make setup-rf3 TABLE_COUNT=10 SOURCE_TOPOLOGY=isolated
 
 | Variant | Main experiment |
 |---|---|
-| A | Shared CDC source; LSN and Kafka consumer-offset proof |
+| A | Shared CDC source; hot state-only admission once per API batch; LSN and Kafka consumer-offset proof |
 | B | Isolated active/migration CDC sources; passive source heartbeat |
 | B+ | B plus an immediate migration-lane heartbeat after the fence |
 | D | B+ plus a hot-local gate lock and epoch check in every table operation |
@@ -129,6 +129,8 @@ make setup-rf3 TABLE_COUNT=10 SOURCE_TOPOLOGY=isolated
 | F | E foreground path plus exact per-leaf Kafka markers and warm receipts |
 | G | Serial per-leaf transactions that atomically detach and insert the marker |
 | H | Parallel per-leaf atomic detach-marker transactions with all-or-recover semantics |
+| H-Prod | H's parallel atomic detach-marker flow on the single shared CDC source (production topology candidate) |
+| H-DD-Prod | Rolling generations on two generation-pinned connector lanes: live partition provisioning, boundary rotation, and lane-isolated H flips with no connector restarts (`SOURCE_TOPOLOGY=lanes` + `make h-dd-prod-rolling-rf3`) |
 
 Variants A–E prove source and sink progress with LSN/offset evidence. F–H use exact marker observation in each retiring leaf topic and exact receipt rows in warm PostgreSQL. All paths remain fail-closed: missing evidence prevents `warm_primary`, and recovery must catalog-verify every reattached leaf before reopening hot ownership.
 
