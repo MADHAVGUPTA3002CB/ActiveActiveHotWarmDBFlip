@@ -1558,6 +1558,7 @@ class OptimisticDetachTransactionSession:
             OptimisticAdmissionCheckMode.STATE_AND_EPOCH
         ),
         update_targets_by_table: tuple[tuple[UpdateTarget, ...], ...] = (),
+        created_at: datetime | None = None,
     ) -> None:
         if not 16 <= payload_bytes <= 1_048_576:
             raise ValueError("payload_bytes must be 16..1,048,576")
@@ -1587,7 +1588,12 @@ class OptimisticDetachTransactionSession:
         self._manifest = manifest
         self._run_id = run_id
         self._timeslot = validate_timeslot(timeslot)
-        self._created_at = RETIRING_START if self._timeslot == "retiring" else ACTIVE_START
+        if created_at is not None:
+            self._created_at = created_at
+        elif self._timeslot in ("retiring", "active"):
+            self._created_at = RETIRING_START if self._timeslot == "retiring" else ACTIVE_START
+        else:
+            raise ValueError("generation timeslots require an explicit created_at timestamp")
         self._payload = {
             "padding": "x" * (payload_bytes - 15),
             "timeslot": self._timeslot,

@@ -4,6 +4,10 @@ COMPOSE_RF3 ?= $(COMPOSE) -f compose.yaml -f compose.rf3.yaml
 TABLE_COUNT ?= 5
 SOURCE_TOPOLOGY ?= shared
 FENCE_WAKEUP_MODE ?= passive
+GENERATIONS ?= 3
+ROLLING_ACTIVE_TPS ?= 300
+ROLLING_RETIRING_TPS ?= 40
+ROLLING_DURATION_SECONDS ?= 15
 SOURCE_BACKLOG_PER_TABLE ?= 1000
 SINK_BACKLOG_PER_TABLE ?= 2000
 OVERLOAD_BATCH_PER_TABLE ?= 1000
@@ -67,6 +71,22 @@ setup:
 
 setup-rf3:
 	$(COMPOSE_RF3) --profile tools run --rm --build runner setup --tables $(TABLE_COUNT)
+
+h-dd-prod-rolling:
+	$(COMPOSE) --profile tools run --rm --build runner rolling \
+		--tables $(TABLE_COUNT) \
+		--generations $(GENERATIONS) \
+		--active-tps $(ROLLING_ACTIVE_TPS) \
+		--retiring-tps $(ROLLING_RETIRING_TPS) \
+		--duration-seconds $(ROLLING_DURATION_SECONDS)
+
+h-dd-prod-rolling-rf3:
+	$(COMPOSE_RF3) --profile tools run --rm --build runner rolling \
+		--tables $(TABLE_COUNT) \
+		--generations $(GENERATIONS) \
+		--active-tps $(ROLLING_ACTIVE_TPS) \
+		--retiring-tps $(ROLLING_RETIRING_TPS) \
+		--duration-seconds $(ROLLING_DURATION_SECONDS)
 
 benchmark:
 	$(COMPOSE) --profile tools run --rm --build runner benchmark \

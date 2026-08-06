@@ -16,6 +16,13 @@ FENCE_RECEIPT_TABLE = "flipbench_fence_receipts"
 FENCE_HEADER_NAME = "flipbench-control"
 FENCE_HEADER_VALUE = "leaf-fence-v1"
 
+# H-DD-Prod generation-pinned connector lanes. Each lane is a persistent connector,
+# slot, and publication; a generation is pinned to exactly one lane for life, and
+# publication membership (not the include pattern) decides which lane emits a leaf.
+LANE_NAMES = ("lane_a", "lane_b")
+_GENERATION_SUFFIX_REGEX = r"g[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{2}"
+_GENERATION_LEAF_REGEX = rf"bench_table_[0-9]{{2}}_p_{_GENERATION_SUFFIX_REGEX}"
+
 
 @dataclass(frozen=True, slots=True)
 class SourceConnectorSpec:
@@ -45,6 +52,15 @@ def topic_names(
         heartbeat_topics = (
             f"{manifest.topic_prefix}.public.dbz_heartbeat",
             f"__debezium-heartbeat.{manifest.topic_prefix}",
+        )
+    elif settings.source_topology == "lanes":
+        return tuple(
+            topic
+            for lane in LANE_NAMES
+            for topic in (
+                f"{manifest.topic_prefix}.public.dbz_heartbeat_{lane}",
+                f"__debezium-heartbeat.{manifest.topic_prefix}.{lane}",
+            )
         )
     else:
         heartbeat_topics = tuple(
@@ -156,7 +172,118 @@ def _source_spec(
     )
 
 
+def _lane_source_spec(
+    settings: Settings,
+    manifest: BenchmarkManifest,
+    lane: str,
+) -> SourceConnectorSpec:
+    if lane not in LANE_NAMES:
+        raise ValueError(f"unknown connector lane: {lane!r}")
+    topic_prefix = f"{manifest.topic_prefix}.{lane}"
+    heartbeat_table = f"dbz_heartbeat_{lane}"
+    marker_topic_pattern = (
+        rf"^{re.escape(topic_prefix)}\.{FENCE_SCHEMA}\.({_GENERATION_LEAF_REGEX})$"
+    )
+    config = {
+        "connector.class": POSTGRES_CONNECTOR,
+        "tasks.max": "1",
+        "topic.prefix": topic_prefix,
+        "database.hostname": "hot",
+        "database.port": "5432",
+        "database.user": settings.source_database_user,
+        "database.password": settings.source_database_password,
+        "database.dbname": "cards",
+        "database.sslmode": "disable",
+        "plugin.name": "pgoutput",
+        "slot.name": f"{settings.slot_name}_{lane}",
+        "publication.name": f"{settings.publication_name}_{lane}",
+        "publication.autocreate.mode": "disabled",
+        "publish.via.partition.root": "false",
+        "snapshot.mode": "no_data",
+        # Generation-independent patterns: creating a new generation must never
+        # require a connector change. The lane publication is the authoritative
+        # filter; these patterns are a superset of every generation's relations.
+        "table.include.list": ",".join(
+            (
+                rf"public\.{_GENERATION_LEAF_REGEX}",
+                rf"{FENCE_SCHEMA}\.{_GENERATION_LEAF_REGEX}",
+                rf"public\.{heartbeat_table}",
+            )
+        ),
+        "include.schema.changes": "false",
+        "tombstones.on.delete": "false",
+        "heartbeat.interval.ms": "250",
+        "heartbeat.action.query": (
+            f"UPDATE public.{heartbeat_table} SET touched_at = clock_timestamp() WHERE id = 1"
+        ),
+        "poll.interval.ms": "100",
+        "lsn.flush.mode": "connector",
+        "decimal.handling.mode": "precise",
+        "producer.override.acks": "all",
+        "producer.override.enable.idempotence": "true",
+        "errors.tolerance": "none",
+        "exactly.once.support": "required",
+        "transaction.boundary": "poll",
+        "predicates": "isFenceTopic",
+        "predicates.isFenceTopic.type": "org.apache.kafka.connect.transforms.predicates.TopicNameMatches",
+        "predicates.isFenceTopic.pattern": marker_topic_pattern,
+        "transforms": "markFence,routeFence,route",
+        "transforms.markFence.type": "org.apache.kafka.connect.transforms.InsertHeader",
+        "transforms.markFence.predicate": "isFenceTopic",
+        "transforms.markFence.header": FENCE_HEADER_NAME,
+        "transforms.markFence.value.literal": FENCE_HEADER_VALUE,
+        "transforms.routeFence.type": "org.apache.kafka.connect.transforms.RegexRouter",
+        "transforms.routeFence.predicate": "isFenceTopic",
+        "transforms.routeFence.regex": marker_topic_pattern,
+        "transforms.routeFence.replacement": f"{manifest.topic_prefix}.public.$1",
+        "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
+        "transforms.route.regex": rf"^{re.escape(topic_prefix)}\.public\.(.+)$",
+        "transforms.route.replacement": f"{manifest.topic_prefix}.public.$1",
+    }
+    return SourceConnectorSpec(
+        lane,
+        f"{settings.source_connector}-{lane.replace('_', '-')}",
+        f"{settings.slot_name}_{lane}",
+        f"{settings.publication_name}_{lane}",
+        topic_prefix,
+        heartbeat_table,
+        (),
+        MappingProxyType(config),
+    )
+
+
+def lane_source_specs(
+    settings: Settings, manifest: BenchmarkManifest
+) -> tuple[SourceConnectorSpec, ...]:
+    return tuple(_lane_source_spec(settings, manifest, lane) for lane in LANE_NAMES)
+
+
+def generation_leaf_topic_regex(manifest: BenchmarkManifest) -> str:
+    return rf"^{re.escape(manifest.topic_prefix)}\.public\.{_GENERATION_LEAF_REGEX}$"
+
+
+def lanes_sink_config(settings: Settings, manifest: BenchmarkManifest) -> dict[str, str]:
+    """Generation-independent sink: one config covers every rolling generation."""
+    router_regex = (
+        rf"^{re.escape(manifest.topic_prefix)}\.public\."
+        rf"(bench_table_[0-9]{{2}})_p_{_GENERATION_SUFFIX_REGEX}$"
+    )
+    config = shared_sink_config(settings, manifest)
+    config.update(
+        {
+            "topics.regex": generation_leaf_topic_regex(manifest),
+            "transforms.routeFence.regex": router_regex,
+            "transforms.route.regex": router_regex,
+            # New generation topics must be discovered quickly without a restart.
+            "consumer.override.metadata.max.age.ms": "5000",
+        }
+    )
+    return config
+
+
 def source_specs(settings: Settings, manifest: BenchmarkManifest) -> tuple[SourceConnectorSpec, ...]:
+    if settings.source_topology == "lanes":
+        return lane_source_specs(settings, manifest)
     if settings.source_topology == "shared":
         return (
             _source_spec(

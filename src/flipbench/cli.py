@@ -19,6 +19,19 @@ def parser() -> argparse.ArgumentParser:
     setup = subcommands.add_parser("setup", help="create tables/topics and register connectors")
     setup.add_argument("--tables", type=int, choices=(5, 10, 15, 20), default=None)
 
+    rolling = subcommands.add_parser(
+        "rolling",
+        help="H-DD-Prod: run consecutive generation-pinned provision/rotate/flip cycles",
+    )
+    rolling.add_argument("--tables", type=int, choices=(5, 10, 15, 20), default=None)
+    rolling.add_argument("--generations", type=int, default=3)
+    rolling.add_argument("--active-tps", type=int, default=300)
+    rolling.add_argument("--retiring-tps", type=int, default=40)
+    rolling.add_argument("--duration-seconds", type=float, default=15.0)
+    rolling.add_argument("--payload-bytes", type=int, default=256)
+    rolling.add_argument("--flip-timeout-seconds", type=float, default=120.0)
+    rolling.add_argument("--quiesce-seconds", type=float, default=3.0)
+
     manifest = subcommands.add_parser("manifest", help="print the canonical route manifest")
     manifest.add_argument("--tables", type=int, choices=(5, 10, 15, 20), default=5)
 
@@ -117,8 +130,38 @@ def main() -> None:
     settings = Settings.from_env(args.tables)
     manifest = build_manifest(settings.table_count, settings.cell, settings.timeslot)
     if args.command == "setup":
-        configured = bootstrap(settings)
+        if settings.source_topology == "lanes":
+            from .generations import bootstrap_lanes
+
+            configured = bootstrap_lanes(settings)
+        else:
+            configured = bootstrap(settings)
         print(canonical_manifest_json(configured))
+    elif args.command == "rolling":
+        import datetime as _datetime
+
+        from .rolling import run_rolling
+
+        if settings.source_topology != "lanes":
+            raise SystemExit("rolling requires SOURCE_TOPOLOGY=lanes (run setup with lanes first)")
+        report = run_rolling(
+            settings,
+            generations=args.generations,
+            active_tps=args.active_tps,
+            retiring_tps=args.retiring_tps,
+            duration_seconds=args.duration_seconds,
+            payload_bytes=args.payload_bytes,
+            flip_timeout_seconds=args.flip_timeout_seconds,
+            quiesce_seconds=args.quiesce_seconds,
+        )
+        stamp = _datetime.datetime.now(_datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        out_dir = settings.results_dir / f"h-dd-prod-rolling-{stamp}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "rolling.json"
+        out_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(json.dumps({"outcome": report["outcome"], "results": str(out_path)}, sort_keys=True))
+        if report["outcome"] != "success":
+            raise SystemExit(1)
     elif args.command == "load":
         run_id = args.run_id or uuid.uuid4()
         inserted = guarded_insert_events(

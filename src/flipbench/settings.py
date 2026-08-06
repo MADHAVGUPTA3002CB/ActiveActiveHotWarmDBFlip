@@ -107,8 +107,8 @@ class Settings:
         if resolved_count not in (5, 10, 15, 20):
             raise ManifestError("TABLE_COUNT must be one of 5, 10, 15, or 20")
         source_topology = os.environ.get("SOURCE_TOPOLOGY", "shared")
-        if source_topology not in ("shared", "isolated"):
-            raise ManifestError("SOURCE_TOPOLOGY must be shared or isolated")
+        if source_topology not in ("shared", "isolated", "lanes"):
+            raise ManifestError("SOURCE_TOPOLOGY must be shared, isolated, or lanes")
 
         def positive_int(name: str, default: int) -> int:
             try:

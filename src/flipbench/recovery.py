@@ -61,11 +61,14 @@ def revert_to_hot(
     manifest: BenchmarkManifest,
     attempt_epoch: int,
     timeout_seconds: float,
+    window: tuple[Any, Any] | None = None,
 ) -> tuple[dict[str, str], ...]:
     if timeout_seconds <= 0:
         raise RecoveryError("recovery timeout must be positive")
-    if manifest.timeslot != "retiring":
-        raise RecoveryError("automatic revert currently supports only the retiring timeslot")
+    if window is None and manifest.timeslot != "retiring":
+        raise RecoveryError(
+            "automatic revert requires the retiring timeslot or an explicit partition window"
+        )
     deadline = time.monotonic() + timeout_seconds
     _refresh_statement_timeout(warm, deadline)
     ownership = warm.execute(
@@ -91,6 +94,10 @@ def revert_to_hot(
 
     from .postgres_io import ACTIVE_START, RETIRING_START
 
+    if window is None:
+        window = (RETIRING_START, ACTIVE_START)
+    window_start, window_end = window
+
     recovered: list[dict[str, str]] = []
     for route in manifest.tables:
         if time.monotonic() >= deadline:
@@ -111,8 +118,8 @@ def revert_to_hot(
                     sql.SQL("ALTER TABLE {} ATTACH PARTITION {} FOR VALUES FROM ({}) TO ({})").format(
                         sql.Identifier(route.parent),
                         sql.Identifier(route.leaf),
-                        sql.Literal(RETIRING_START),
-                        sql.Literal(ACTIVE_START),
+                        sql.Literal(window_start),
+                        sql.Literal(window_end),
                     )
                 )
             elif step == "verify" and _catalog_state(hot, route.parent, route.leaf) is not CatalogLeafState.ATTACHED:
