@@ -168,7 +168,7 @@ class BenchmarkCase:
 
     @property
     def ownership_epoch_checks_per_api_batch(self) -> int:
-        if self.variant == "H":
+        if self.variant in ("A", "H", "H-Prod"):
             return 0
         if self.variant in ("E", "F", "G"):
             return 1
@@ -410,10 +410,10 @@ def build_benchmark_cases(plan: BenchmarkPlan) -> tuple[BenchmarkCase, ...]:
                         shape,
                         1,
                         plan.table_count,
-                        1 if variant in ("E", "F", "G", "H") else plan.table_count,
+                        1 if variant in ("A", "E", "F", "G", "H", "H-Prod") else plan.table_count,
                         (
                             "state_only_v1"
-                            if variant == "H"
+                            if variant in ("A", "H", "H-Prod")
                             else "state_and_epoch_v1"
                         ),
                     )

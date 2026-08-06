@@ -43,7 +43,7 @@ class MatrixObservation:
 
 _VARIANTS = MappingProxyType(
     {
-        "A": ("shared", "passive", "warm_tracker_advisory_v1", "slot_lsn_v1"),
+        "A": ("shared", "passive", "optimistic_detach_v1", "slot_lsn_v1"),
         "B": ("isolated", "passive", "warm_tracker_advisory_v1", "slot_lsn_v1"),
         "B+": ("isolated", "immediate_heartbeat", "warm_tracker_advisory_v1", "slot_lsn_v1"),
         "D": ("isolated", "immediate_heartbeat", "hot_transactional_v1", "slot_lsn_v1"),
@@ -51,6 +51,7 @@ _VARIANTS = MappingProxyType(
         "F": ("isolated", "passive", "optimistic_detach_v1", "per_leaf_marker_v1"),
         "G": ("isolated", "passive", "optimistic_detach_v1", "atomic_detach_marker_v1"),
         "H": ("isolated", "passive", "optimistic_detach_v1", "parallel_atomic_detach_marker_v1"),
+        "H-Prod": ("shared", "passive", "optimistic_detach_v1", "parallel_atomic_detach_marker_v1"),
     }
 )
 

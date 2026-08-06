@@ -8,6 +8,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
+from .core import state_only_batch_admission_supported
+
 
 class ResultValidationError(ValueError):
     pass
@@ -724,9 +726,17 @@ def validate_result(payload: Mapping[str, Any]) -> None:
                         "legacy Variant E first-write admission evidence is inconsistent"
                     )
             elif contract_version == "state_only_batch_first_write_admission_v4":
+                topology = payload.get("topology")
+                topology = topology if isinstance(topology, Mapping) else {}
                 if (
-                    scenario.get("source_proof_mode")
-                    != "parallel_atomic_detach_marker_v1"
+                    not state_only_batch_admission_supported(
+                        scenario.get(
+                            "source_topology", topology.get("source_topology")
+                        ),
+                        scenario.get("fence_wakeup_mode", "passive"),
+                        write_fence_mode,
+                        scenario.get("source_proof_mode"),
+                    )
                     or scenario.get("optimistic_admission_check_mode")
                     != "state_only_v1"
                     or transaction_shape != "api_batch_separate_commits_v1"
@@ -741,7 +751,7 @@ def validate_result(payload: Mapping[str, Any]) -> None:
                     != "single_worker_reserved_v1"
                 ):
                     raise ResultValidationError(
-                        "Variant H state-only batch-admission evidence is inconsistent"
+                        "Variant A/H state-only batch-admission evidence is inconsistent"
                     )
             else:
                 if (

@@ -249,7 +249,9 @@ function formatDuration(ns: number | null | undefined) {
 
 function formatFenceExperiment(run: SavedRun) {
   if (run.source_proof_mode === "parallel_atomic_detach_marker_v1") {
-    return "H · parallel atomic detach + per-leaf marker";
+    return run.source_topology === "shared"
+      ? "H-Prod · parallel detach markers on the single shared source"
+      : "H · parallel atomic detach + per-leaf marker";
   }
   if (run.source_proof_mode === "atomic_detach_marker_v1") {
     return "G · atomic detach + per-leaf marker";
@@ -258,6 +260,12 @@ function formatFenceExperiment(run: SavedRun) {
     return "F · per-leaf CDC marker receipts";
   }
   if (run.write_fence_mode === "optimistic_detach_v1") {
+    if (
+      run.source_topology === "shared"
+      && run.optimistic_admission_check_mode === "state_only_v1"
+    ) {
+      return "A · hot state-only admission + shared LSN proof";
+    }
     return "E · batch-admitted optimistic detach";
   }
   if (run.write_fence_mode === "hot_transactional_v1") {
@@ -478,9 +486,9 @@ export function Playground() {
   const detachEvents = state?.flip.events.filter((event) => event.stage.startsWith("t4_")) ?? [];
   const detachDone = state ? detachEvents.length >= state.environment.table_count : false;
   const optimisticDetach = workload?.write_fence_mode === "optimistic_detach_v1";
-  const stateOnlyVariantH = optimisticDetach && workload?.optimistic_admission_check_mode === "state_only_v1";
-  const effectiveSourceProofMode = stateOnlyVariantH ? "parallel_atomic_detach_marker_v1" : sourceProofMode;
-  const effectiveFenceWakeupMode = stateOnlyVariantH ? "passive" : fenceWakeupMode;
+  const stateOnlyAdmission = optimisticDetach && workload?.optimistic_admission_check_mode === "state_only_v1";
+  const effectiveSourceProofMode = sourceProofMode;
+  const effectiveFenceWakeupMode = stateOnlyAdmission ? "passive" : fenceWakeupMode;
   const hotGateMode = workload?.write_fence_mode === "hot_transactional_v1" || optimisticDetach;
   const visibleStages = optimisticDetach ? [
     ["t1", "Admit", "Thresholds proved"],
@@ -595,17 +603,26 @@ export function Playground() {
             {workload.mode === "target_rate_v1" ? <>
               <label className="field"><span>Ownership fence</span><div className="select-shell"><select value={workload.write_fence_mode} disabled={state.workload.running || controlsDisabled} onChange={(event) => {
                 const mode = event.target.value as Settings["write_fence_mode"];
+                const sharedSource = state.environment.source_topology === "shared";
+                const sharedStateOnly = mode === "optimistic_detach_v1" && sharedSource;
                 setWorkload({
                   ...workload,
                   write_fence_mode: mode,
-                  optimistic_admission_check_mode: "state_and_epoch_v1",
+                  optimistic_admission_check_mode: sharedStateOnly ? "state_only_v1" : "state_and_epoch_v1",
                 });
-                if (mode !== "optimistic_detach_v1") setSourceProofMode("slot_lsn_v1");
-                if (mode === "hot_transactional_v1" || mode === "optimistic_detach_v1") setFenceWakeupMode("immediate_heartbeat");
+                if (sharedStateOnly) {
+                  if (sourceProofMode !== "parallel_atomic_detach_marker_v1") {
+                    setSourceProofMode("slot_lsn_v1");
+                  }
+                  setFenceWakeupMode("passive");
+                } else {
+                  if (mode !== "optimistic_detach_v1") setSourceProofMode("slot_lsn_v1");
+                  if (mode === "hot_transactional_v1" || mode === "optimistic_detach_v1") setFenceWakeupMode("immediate_heartbeat");
+                }
               }}>
-                <option value="warm_tracker_advisory_v1">A/B/B+ — warm tracker guard</option>
+                <option value="warm_tracker_advisory_v1">B/B+ — warm tracker guard</option>
                 <option value="hot_transactional_v1" disabled={state.environment.source_topology !== "isolated"}>D — hot-local transaction fence</option>
-                <option value="optimistic_detach_v1" disabled={state.environment.source_topology !== "isolated"}>E — batch admission + separate commits</option>
+                <option value="optimistic_detach_v1">A/E–H — hot batch admission + separate commits</option>
               </select></div></label>
               {workload.write_fence_mode === "optimistic_detach_v1" && <label className="field"><span>API batch admission check</span><div className="select-shell"><select value={workload.optimistic_admission_check_mode} disabled={state.workload.running || controlsDisabled} onChange={(event) => {
                 const mode = event.target.value as Settings["optimistic_admission_check_mode"];
@@ -614,15 +631,19 @@ export function Playground() {
                   optimistic_admission_check_mode: mode,
                 });
                 if (mode === "state_only_v1") {
-                  setSourceProofMode("parallel_atomic_detach_marker_v1");
+                  if (state.environment.source_topology === "isolated") {
+                    setSourceProofMode("parallel_atomic_detach_marker_v1");
+                  } else if (sourceProofMode !== "parallel_atomic_detach_marker_v1") {
+                    setSourceProofMode("slot_lsn_v1");
+                  }
                   setFenceWakeupMode("passive");
                 } else if (sourceProofMode === "parallel_atomic_detach_marker_v1") {
                   setSourceProofMode("slot_lsn_v1");
                   setFenceWakeupMode("immediate_heartbeat");
                 }
               }}>
-                <option value="state_and_epoch_v1">E–G — state + epoch</option>
-                <option value="state_only_v1">H — state only</option>
+                <option value="state_and_epoch_v1" disabled={state.environment.source_topology !== "isolated"}>E–G — state + epoch</option>
+                <option value="state_only_v1">A/H — state only</option>
               </select></div></label>}
               <div className="topology-row"><span>Total requested rate</span><strong>{formatNumber(workload.active_target_tps + workload.retiring_target_tps)} TPS</strong></div>
               <div className="field-grid two">
@@ -650,7 +671,7 @@ export function Playground() {
                 <NumberField label="Rate window" value={workload.rate_window_seconds} unit="seconds" min={1} max={60} disabled={state.workload.running} onChange={(value) => setWorkload({ ...workload, rate_window_seconds: value })} />
               </div>
               <NumberField label="Minimum achieved rate" value={workload.min_achievement_percent} unit="% of target" min={1} max={100} onChange={(value) => setWorkload({ ...workload, min_achievement_percent: value })} />
-              <div className="info-note"><CircleAlert size={14} /><span>{workload.write_fence_mode === "optimistic_detach_v1" ? workload.optimistic_admission_check_mode === "state_only_v1" ? `Variant H checks only that the hot gate is open in the first of ${state.environment.table_count} separately committed operations. It sends no ownership epoch; detach errors protect later operations.` : `Variants E–G check state and epoch in the first of ${state.environment.table_count} separately committed operations; the remaining operations make no gate read.` : workload.write_fence_mode === "hot_transactional_v1" ? "Variant D checks the durable ownership epoch once inside every hot transaction and makes no warm PostgreSQL call. It requires isolated sources and the immediate fence nudge." : "TPS is aggregate across all tables. One transaction targets one table and is counted only after PostgreSQL COMMIT succeeds."}</span></div>
+              <div className="info-note"><CircleAlert size={14} /><span>{workload.write_fence_mode === "optimistic_detach_v1" ? workload.optimistic_admission_check_mode === "state_only_v1" ? `Variants A and H check only that the hot gate is open in the first of ${state.environment.table_count} separately committed operations. A then uses LSN/offset proof; H uses exact markers. Neither sends an ownership epoch from the application path.` : `Variants E–G check state and epoch in the first of ${state.environment.table_count} separately committed operations; the remaining operations make no gate read.` : workload.write_fence_mode === "hot_transactional_v1" ? "Variant D checks the durable ownership epoch once inside every hot transaction and makes no warm PostgreSQL call. It requires isolated sources and the immediate fence nudge." : "TPS is aggregate across all tables. One transaction targets one table and is counted only after PostgreSQL COMMIT succeeds."}</span></div>
             </> : <>
               <NumberField label="Active rows / partition / batch" value={workload.active_rows_per_partition} min={1} onChange={(value) => setWorkload({ ...workload, active_rows_per_partition: value })} />
               <NumberField label="Retiring rows / partition / batch" value={workload.retiring_rows_per_partition} onChange={(value) => setWorkload({ ...workload, retiring_rows_per_partition: value })} />
@@ -689,17 +710,17 @@ export function Playground() {
               <option value="passive">{state.environment.source_topology === "isolated" ? "B — Passive heartbeat (control)" : "A — Passive heartbeat (control)"}</option>
               <option value="immediate_heartbeat">{state.environment.source_topology === "isolated" ? "B+ — Immediate fence nudge" : "A+ — Immediate fence nudge"}</option>
             </select></div></label>
-            <label className="field"><span>Source and sink proof</span><div className="select-shell"><select value={effectiveSourceProofMode} disabled={controlsDisabled || state.flip.status === "running" || stateOnlyVariantH} onChange={(event) => {
+            <label className="field"><span>Source and sink proof</span><div className="select-shell"><select value={effectiveSourceProofMode} disabled={controlsDisabled || state.flip.status === "running"} onChange={(event) => {
               const mode = event.target.value as "slot_lsn_v1" | "per_leaf_marker_v1" | "atomic_detach_marker_v1" | "parallel_atomic_detach_marker_v1";
               setSourceProofMode(mode);
               if (mode !== "slot_lsn_v1") setFenceWakeupMode("passive");
             }}>
-              <option value="slot_lsn_v1">Existing — LSN + committed offsets</option>
+              <option value="slot_lsn_v1" disabled={stateOnlyAdmission && state.environment.source_topology === "isolated"}>A/B/B+/D/E — LSN + committed offsets</option>
               <option value="per_leaf_marker_v1" disabled={state.environment.source_topology !== "isolated" || workload.write_fence_mode !== "optimistic_detach_v1" || workload.optimistic_admission_check_mode !== "state_and_epoch_v1"}>F — Per-leaf CDC marker receipts</option>
               <option value="atomic_detach_marker_v1" disabled={state.environment.source_topology !== "isolated" || workload.write_fence_mode !== "optimistic_detach_v1" || workload.optimistic_admission_check_mode !== "state_and_epoch_v1"}>G — Atomic detach + per-leaf marker</option>
-              <option value="parallel_atomic_detach_marker_v1" disabled={state.environment.source_topology !== "isolated" || workload.write_fence_mode !== "optimistic_detach_v1" || workload.optimistic_admission_check_mode !== "state_only_v1"}>H — Parallel atomic detach + markers</option>
+              <option value="parallel_atomic_detach_marker_v1" disabled={workload.write_fence_mode !== "optimistic_detach_v1" || workload.optimistic_admission_check_mode !== "state_only_v1"}>{state.environment.source_topology === "isolated" ? "H — Parallel atomic detach + markers" : "H-Prod — Parallel detach markers on the shared source"}</option>
             </select></div></label>
-            <div className="info-note"><CircleAlert size={14} /><span>{effectiveSourceProofMode === "parallel_atomic_detach_marker_v1" ? "Variant H starts one independent detach + marker transaction for every retiring leaf at the same time. If any leaf fails, all workers finish and every detached leaf is reattached before the gate reopens." : effectiveSourceProofMode === "atomic_detach_marker_v1" ? "Variant G commits each blocking leaf detach and its unique CDC marker in the same hot PostgreSQL transaction, then waits for that exact marker in Kafka and warm PostgreSQL." : effectiveSourceProofMode === "per_leaf_marker_v1" ? "Variant F emits one durable PostgreSQL marker per retiring leaf after concurrent detaches, observes its exact Kafka offset, and waits for the matching warm JDBC receipt." : "The existing proof waits for the migration slot LSN and then the JDBC sink consumer offsets."}</span></div>
+            <div className="info-note"><CircleAlert size={14} /><span>{effectiveSourceProofMode === "parallel_atomic_detach_marker_v1" ? (state.environment.source_topology === "shared" ? "Variant H-Prod runs H's parallel detach + marker transactions while the single shared source connector carries both active and retiring changes. Marker proof strength is unchanged; marker latency now shares the connector queue with active traffic." : "Variant H starts one independent detach + marker transaction for every retiring leaf at the same time. If any leaf fails, all workers finish and every detached leaf is reattached before the gate reopens.") : effectiveSourceProofMode === "atomic_detach_marker_v1" ? "Variant G commits each blocking leaf detach and its unique CDC marker in the same hot PostgreSQL transaction, then waits for that exact marker in Kafka and warm PostgreSQL." : effectiveSourceProofMode === "per_leaf_marker_v1" ? "Variant F emits one durable PostgreSQL marker per retiring leaf after concurrent detaches, observes its exact Kafka offset, and waits for the matching warm JDBC receipt." : stateOnlyAdmission && state.environment.source_topology === "shared" ? "Variant A uses the same hot state-only batch admission as H-Prod, then keeps A's shared-slot LSN and transaction-aware committed-offset proof." : "The LSN proof waits for the selected replication slot and then the JDBC sink consumer offsets."}</span></div>
             <button className="button secondary full" type="submit" disabled={controlsDisabled}>
               {pending === "thresholds" ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />} Apply thresholds
             </button>
@@ -762,7 +783,7 @@ export function Playground() {
               </div>
               <button className="flip-button" disabled={!flipAllowed || controlsDisabled} onClick={() => act("flip", () => request("/flip/start", { method: "POST", body: JSON.stringify({ fence_wakeup_mode: effectiveFenceWakeupMode, source_proof_mode: effectiveSourceProofMode }) }))}>
                 {state.flip.status === "running" || pending === "flip" ? <LoaderCircle className="spin" size={18} /> : <Zap size={18} fill="currentColor" />}
-                {state.flip.status === "running" ? "Flipping…" : `Start flip · ${effectiveSourceProofMode === "parallel_atomic_detach_marker_v1" ? "H" : effectiveSourceProofMode === "atomic_detach_marker_v1" ? "G" : effectiveSourceProofMode === "per_leaf_marker_v1" ? "F" : workload.write_fence_mode === "optimistic_detach_v1" ? "E" : workload.write_fence_mode === "hot_transactional_v1" ? "D" : effectiveFenceWakeupMode === "immediate_heartbeat" ? `${state.environment.source_topology === "isolated" ? "B+" : "A+"}` : `${state.environment.source_topology === "isolated" ? "B" : "A"}`}`}
+                {state.flip.status === "running" ? "Flipping…" : `Start flip · ${effectiveSourceProofMode === "parallel_atomic_detach_marker_v1" ? (state.environment.source_topology === "shared" ? "H-Prod" : "H") : effectiveSourceProofMode === "atomic_detach_marker_v1" ? "G" : effectiveSourceProofMode === "per_leaf_marker_v1" ? "F" : workload.write_fence_mode === "optimistic_detach_v1" && state.environment.source_topology === "shared" ? "A" : workload.write_fence_mode === "optimistic_detach_v1" ? "E" : workload.write_fence_mode === "hot_transactional_v1" ? "D" : effectiveFenceWakeupMode === "immediate_heartbeat" ? `${state.environment.source_topology === "isolated" ? "B+" : "A+"}` : `${state.environment.source_topology === "isolated" ? "B" : "A"}`}`}
                 <ArrowRight size={17} />
               </button>
             </div>
@@ -861,7 +882,7 @@ export function Playground() {
                     <div><span>Target transaction rate</span><strong>{selectedRun.target_tps === null ? "Not recorded" : `${formatNumber(selectedRun.target_tps)} TPS`}</strong></div>
                     <div><span>Achieved transaction rate</span><strong>{selectedRun.achieved_tps === null ? "Not recorded" : `${formatNumber(selectedRun.achieved_tps)} TPS`}</strong></div>
                   </div>
-                  <dl><div><dt>Run ID</dt><dd>{selectedRun.run_id}</dd></div><div><dt>Attempt ID</dt><dd>{selectedRun.attempt_id ?? "unknown"}</dd></div><div><dt>Profile</dt><dd>{selectedRun.profile ?? "unknown"}</dd></div><div><dt>Transaction shape</dt><dd>{selectedRun.transaction_shape === "api_batch_separate_commits_v1" ? `${selectedRun.operations_per_api_batch ?? "?"} operations / API batch · ${selectedRun.ownership_reads_per_api_batch ?? "?"} ownership read · ${selectedRun.ownership_epoch_checks_per_api_batch ?? "?"} epoch checks · ${selectedRun.postgres_transactions_per_api_batch ?? "?"} separate PostgreSQL transactions` : selectedRun.transaction_shape === "single_table_api" ? "one selected table / transaction" : selectedRun.transaction_shape === "legacy_unreserved_batch_scheduler" ? "legacy unreserved API batch (superseded)" : selectedRun.transaction_shape === "legacy_batch_admission_extra_transaction" ? "legacy standalone admission transaction (superseded)" : selectedRun.transaction_shape === "legacy_per_transaction_gate_api" ? "legacy gate read per transaction (superseded)" : selectedRun.transaction_shape === "legacy_all_tables_api" ? "legacy all-tables / transaction (superseded)" : "legacy/unknown"}</dd></div><div><dt>Admission check</dt><dd>{selectedRun.optimistic_admission_check_mode === "state_only_v1" ? "state only (H)" : selectedRun.optimistic_admission_check_mode === "state_and_epoch_v1" ? "state + epoch" : "legacy/unknown"}</dd></div><div><dt>Source topology</dt><dd>{selectedRun.source_topology ?? "legacy/unknown"}</dd></div><div><dt>Fence wake-up</dt><dd>{formatFenceExperiment(selectedRun)}</dd></div><div><dt>Heartbeat applied</dt><dd>{selectedRun.fence_wakeup_applied === true ? "yes" : selectedRun.fence_wakeup_applied === false ? "no" : "unknown"}</dd></div><div><dt>Generation</dt><dd>{selectedRun.environment_generation_id ?? "legacy"}</dd></div></dl>
+                  <dl><div><dt>Run ID</dt><dd>{selectedRun.run_id}</dd></div><div><dt>Attempt ID</dt><dd>{selectedRun.attempt_id ?? "unknown"}</dd></div><div><dt>Profile</dt><dd>{selectedRun.profile ?? "unknown"}</dd></div><div><dt>Transaction shape</dt><dd>{selectedRun.transaction_shape === "api_batch_separate_commits_v1" ? `${selectedRun.operations_per_api_batch ?? "?"} operations / API batch · ${selectedRun.ownership_reads_per_api_batch ?? "?"} ownership read · ${selectedRun.ownership_epoch_checks_per_api_batch ?? "?"} epoch checks · ${selectedRun.postgres_transactions_per_api_batch ?? "?"} separate PostgreSQL transactions` : selectedRun.transaction_shape === "single_table_api" ? "one selected table / transaction" : selectedRun.transaction_shape === "legacy_unreserved_batch_scheduler" ? "legacy unreserved API batch (superseded)" : selectedRun.transaction_shape === "legacy_batch_admission_extra_transaction" ? "legacy standalone admission transaction (superseded)" : selectedRun.transaction_shape === "legacy_per_transaction_gate_api" ? "legacy gate read per transaction (superseded)" : selectedRun.transaction_shape === "legacy_all_tables_api" ? "legacy all-tables / transaction (superseded)" : "legacy/unknown"}</dd></div><div><dt>Admission check</dt><dd>{selectedRun.optimistic_admission_check_mode === "state_only_v1" ? "state only (A/H)" : selectedRun.optimistic_admission_check_mode === "state_and_epoch_v1" ? "state + epoch" : "legacy/unknown"}</dd></div><div><dt>Source topology</dt><dd>{selectedRun.source_topology ?? "legacy/unknown"}</dd></div><div><dt>Fence wake-up</dt><dd>{formatFenceExperiment(selectedRun)}</dd></div><div><dt>Heartbeat applied</dt><dd>{selectedRun.fence_wakeup_applied === true ? "yes" : selectedRun.fence_wakeup_applied === false ? "no" : "unknown"}</dd></div><div><dt>Generation</dt><dd>{selectedRun.environment_generation_id ?? "legacy"}</dd></div></dl>
                   {selectedRun.artifact_type === "ownership_grant" && <p className="checkpoint-note"><CircleAlert size={13} />Ownership was durably granted at t13. Post-grant parity verification was still pending when this checkpoint was read.</p>}
                 </div>}
               </div>

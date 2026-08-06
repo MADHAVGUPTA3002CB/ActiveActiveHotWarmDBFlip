@@ -108,6 +108,83 @@ class KafkaControl:
         finally:
             consumer.close()
 
+    def read_committed_target_offsets(
+        self,
+        partitions: Sequence[TopicPartition],
+        start_offsets: Mapping[TopicPartition, int],
+        timeout_seconds: float,
+    ) -> Mapping[TopicPartition, int]:
+        """Return the next offsets after the last read-committed data records.
+
+        Broker high watermarks include Kafka transaction-control records, which
+        are intentionally hidden from application consumers. Scanning from the
+        sink's committed positions to read-committed EOF produces targets that
+        the sink consumer group can actually reach.
+        """
+        from confluent_kafka import KafkaError
+
+        expected = frozenset(partitions)
+        if not expected or len(expected) != len(partitions):
+            raise OffsetError("read-committed target partitions must be complete and unique")
+        if set(start_offsets) != set(expected):
+            raise OffsetError("read-committed target starts must match every partition")
+        if timeout_seconds <= 0:
+            raise TimeoutError("read-committed target query timeout must be positive")
+        if any(
+            not isinstance(offset, int) or isinstance(offset, bool) or offset < 0
+            for offset in start_offsets.values()
+        ):
+            raise OffsetError("read-committed target starts must be non-negative offsets")
+
+        consumer = self._consumer(
+            "flipbench-read-committed-target-observer",
+            enable_partition_eof=True,
+        )
+        consumer.assign(
+            [
+                KafkaTopicPartition(
+                    partition.topic,
+                    partition.partition,
+                    start_offsets[partition],
+                )
+                for partition in sorted(expected)
+            ]
+        )
+        targets = dict(start_offsets)
+        awaiting_eof = set(expected)
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            while awaiting_eof:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    missing = sorted(partition.key for partition in awaiting_eof)
+                    raise TimeoutError(
+                        f"read-committed target scan did not reach EOF: {missing}"
+                    )
+                message = consumer.poll(min(0.25, remaining))
+                if message is None:
+                    continue
+                partition = TopicPartition(message.topic(), message.partition())
+                if partition not in expected:
+                    raise OffsetError(
+                        f"read-committed target observer received unexpected partition {partition.key}"
+                    )
+                error = message.error()
+                if error is not None:
+                    if error.code() == KafkaError._PARTITION_EOF:
+                        awaiting_eof.discard(partition)
+                        continue
+                    raise OffsetError(f"read-committed target observer failed: {error}")
+                next_offset = message.offset() + 1
+                if next_offset < targets[partition]:
+                    raise OffsetError(
+                        f"read-committed target observer moved backward on {partition.key}"
+                    )
+                targets[partition] = next_offset
+            return targets
+        finally:
+            consumer.close()
+
     def committed_offsets(
         self,
         group_by_partition: Mapping[TopicPartition, str],
@@ -246,14 +323,15 @@ class KafkaControl:
             consumer.close()
         self._group_consumers = {}
 
-    def _consumer(self, group: str) -> Consumer:
-        return Consumer(
-            {
-                "bootstrap.servers": self._bootstrap,
-                "group.id": group,
-                "enable.auto.commit": False,
-                "auto.offset.reset": "earliest",
-                "isolation.level": "read_committed",
-                "socket.timeout.ms": 10_000,
-            }
-        )
+    def _consumer(self, group: str, *, enable_partition_eof: bool = False) -> Consumer:
+        config: dict[str, object] = {
+            "bootstrap.servers": self._bootstrap,
+            "group.id": group,
+            "enable.auto.commit": False,
+            "auto.offset.reset": "earliest",
+            "isolation.level": "read_committed",
+            "socket.timeout.ms": 10_000,
+        }
+        if enable_partition_eof:
+            config = {**config, "enable.partition.eof": True}
+        return Consumer(config)

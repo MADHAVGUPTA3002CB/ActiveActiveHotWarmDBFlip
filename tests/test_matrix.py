@@ -37,7 +37,7 @@ class FullMatrixPlanTests(unittest.TestCase):
         self.assertEqual(
             (by_variant["A"].source_topology, by_variant["A"].fence_wakeup_mode,
              by_variant["A"].write_fence_mode),
-            ("shared", "passive", "warm_tracker_advisory_v1"),
+            ("shared", "passive", "optimistic_detach_v1"),
         )
         self.assertEqual(
             (by_variant["B"].source_topology, by_variant["B"].fence_wakeup_mode,
@@ -85,6 +85,15 @@ class FullMatrixPlanTests(unittest.TestCase):
             variant_dimensions("H"),
             (
                 "isolated",
+                "passive",
+                "optimistic_detach_v1",
+                "parallel_atomic_detach_marker_v1",
+            ),
+        )
+        self.assertEqual(
+            variant_dimensions("H-Prod"),
+            (
+                "shared",
                 "passive",
                 "optimistic_detach_v1",
                 "parallel_atomic_detach_marker_v1",

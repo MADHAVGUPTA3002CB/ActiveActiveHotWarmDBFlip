@@ -105,6 +105,38 @@ class BenchmarkHarnessTests(unittest.TestCase):
             "state_only_v1",
         )
 
+    def test_variant_a_workload_matches_h_prod_foreground_admission(self) -> None:
+        payload = valid_plan()
+        payload["variants"] = ["A", "H-Prod"]
+        payload["target_tps"] = [5_000]
+        payload["repetitions"] = 1
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plan.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            plan = load_benchmark_plan(path)
+
+        by_variant = {
+            case.variant: case for case in build_benchmark_cases(plan)
+        }
+        variant_a = HARNESS._workload_payload(plan, by_variant["A"])
+        h_prod = HARNESS._workload_payload(plan, by_variant["H-Prod"])
+
+        self.assertEqual(
+            variant_a["write_fence_mode"],
+            h_prod["write_fence_mode"],
+        )
+        self.assertEqual(
+            variant_a["optimistic_admission_check_mode"],
+            h_prod["optimistic_admission_check_mode"],
+        )
+        self.assertEqual(
+            HARNESS._flip_payload(by_variant["A"]),
+            {
+                "fence_wakeup_mode": "passive",
+                "source_proof_mode": "slot_lsn_v1",
+            },
+        )
+
     def test_workload_payload_carries_the_generic_insert_update_mix(self) -> None:
         payload = valid_plan()
         payload["variants"] = ["A", "D", "H"]

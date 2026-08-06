@@ -12,6 +12,76 @@ HAS_CONFLUENT_KAFKA = importlib.util.find_spec("confluent_kafka") is not None
 
 @unittest.skipUnless(HAS_CONFLUENT_KAFKA, "confluent-kafka is installed in the runner image")
 class KafkaControlTests(unittest.TestCase):
+    def test_read_committed_target_offsets_ignore_transaction_control_gaps(self) -> None:
+        from confluent_kafka import KafkaError
+
+        from flipbench.kafka_io import KafkaControl
+
+        first = TopicPartition("topic-a", 0)
+        second = TopicPartition("topic-b", 0)
+
+        def data_message(partition: TopicPartition, offset: int) -> Mock:
+            message = Mock()
+            message.error.return_value = None
+            message.topic.return_value = partition.topic
+            message.partition.return_value = partition.partition
+            message.offset.return_value = offset
+            return message
+
+        def eof_message(partition: TopicPartition) -> Mock:
+            error = Mock()
+            error.code.return_value = KafkaError._PARTITION_EOF
+            message = Mock()
+            message.error.return_value = error
+            message.topic.return_value = partition.topic
+            message.partition.return_value = partition.partition
+            return message
+
+        consumer = Mock()
+        consumer.poll.side_effect = (
+            data_message(first, 102),
+            eof_message(first),
+            eof_message(second),
+        )
+        control = KafkaControl.__new__(KafkaControl)
+        control._consumer = Mock(return_value=consumer)
+
+        observed = control.read_committed_target_offsets(
+            (first, second),
+            {first: 100, second: 200},
+            timeout_seconds=1,
+        )
+
+        # topic-a may contain an invisible transaction-control record at 103;
+        # the correct sink target is still the next offset after visible data.
+        self.assertEqual(observed, {first: 103, second: 200})
+        control._consumer.assert_called_once_with(
+            "flipbench-read-committed-target-observer",
+            enable_partition_eof=True,
+        )
+        consumer.assign.assert_called_once()
+        consumer.close.assert_called_once()
+
+    def test_read_committed_target_offsets_require_complete_non_negative_starts(self) -> None:
+        from flipbench.kafka_io import KafkaControl
+
+        first = TopicPartition("topic-a", 0)
+        second = TopicPartition("topic-b", 0)
+        control = KafkaControl.__new__(KafkaControl)
+
+        with self.assertRaises(OffsetError):
+            control.read_committed_target_offsets(
+                (first, second),
+                {first: 0},
+                timeout_seconds=1,
+            )
+        with self.assertRaises(OffsetError):
+            control.read_committed_target_offsets(
+                (first,),
+                {first: -1},
+                timeout_seconds=1,
+            )
+
     def test_marker_observer_returns_exact_marker_next_offsets(self) -> None:
         from flipbench.connector_configs import FENCE_HEADER_NAME, FENCE_HEADER_VALUE
         from flipbench.kafka_io import KafkaControl

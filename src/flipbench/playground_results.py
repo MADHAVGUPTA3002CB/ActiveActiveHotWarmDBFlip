@@ -118,7 +118,7 @@ def summarize_result(payload: Mapping[str, Any]) -> dict[str, Any]:
     topology = topology if isinstance(topology, Mapping) else {}
     source_topology = (
         payload.get("source_topology", topology.get("source_topology"))
-        if payload.get("schema_version") in (2, 3, 4)
+        if payload.get("schema_version") in (2, 3, 4, 5, 6, 7)
         else None
     )
     if source_topology not in ("shared", "isolated"):

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "name": "h-vs-h-prod-5000-mixed-one-repetition",
+  "description": "One fresh matched run each for isolated-source H and single-shared-source H-Prod at 5,000 requested TPS with a 50 percent indexed UPDATE mix on both lanes.",
+  "variants": ["H", "H-Prod"],
+  "target_tps": [5000],
+  "repetitions": 1,
+  "random_seed": 20260806,
+  "table_count": 5,
+  "active_percent": 90,
+  "workload": {
+    "rows_per_transaction": 1,
+    "payload_bytes": 256,
+    "active_update_percent": 50,
+    "retiring_update_percent": 50,
+    "update_seed_rows_per_table": 1000,
+    "active_workers": 32,
+    "retiring_workers": 8,
+    "queue_limit_per_lane": 30000,
+    "rate_window_seconds": 5,
+    "minimum_achievement_percent": 5
+  },
+  "timing": {
+    "warmup_seconds": 25,
+    "measurement_seconds": 20,
+    "sample_interval_seconds": 1,
+    "final_healthy_samples": 5,
+    "flip_timeout_seconds": 180,
+    "restart_timeout_seconds": 900
+  },
+  "admission": {
+    "max_source_lag_bytes": 536870912,
+    "max_sink_lag_records_per_partition": 250000,
+    "stable_samples": 6,
+    "poll_ms": 50,
+    "park_budget_ms": 120000,
+    "revert_reserve_ms": 20000
+  },
+  "safety": {
+    "minimum_free_disk_gib": 20,
+    "stop_on_correctness_failure": true
+  }
+}

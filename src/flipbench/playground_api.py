@@ -20,6 +20,7 @@ from .core import (
     TopicPartition,
     WriteFenceMode,
     build_manifest,
+    state_only_batch_admission_supported,
 )
 from .flip import FlipRunner
 from .kafka_io import KafkaControl
@@ -537,27 +538,38 @@ class PlaygroundRuntime:
             admission_check_mode = OptimisticAdmissionCheckMode(
                 workload_settings.optimistic_admission_check_mode
             )
+            state_only_contract = state_only_batch_admission_supported(
+                self.settings.source_topology,
+                selected_request.fence_wakeup_mode,
+                workload_settings.write_fence_mode,
+                selected_request.source_proof_mode,
+            )
             if marker_variant and (
                 workload_settings.write_fence_mode
                 != WriteFenceMode.OPTIMISTIC_DETACH.value
-                or self.settings.source_topology != "isolated"
                 or selected_request.fence_wakeup_mode is not FenceWakeupMode.PASSIVE
+                or (
+                    self.settings.source_topology != "isolated"
+                    and not parallel_marker_variant
+                )
             ):
                 raise RuntimeError(
-                    "Marker variants F, G and H require Variant E writes, isolated sources, and passive heartbeat mode"
+                    "Marker variants require Variant E writes and passive heartbeat mode;"
+                    " F and G additionally require isolated sources, while the parallel"
+                    " marker variant runs on isolated (H) or shared (H-Prod) sources"
                 )
-            if parallel_marker_variant and (
+            if state_only_contract and (
                 admission_check_mode is not OptimisticAdmissionCheckMode.STATE_ONLY
             ):
                 raise RuntimeError(
-                    "Variant H requires state-only API batch admission"
+                    "Variant H and revised Variant A require state-only API batch admission"
                 )
             if (
-                not parallel_marker_variant
+                not state_only_contract
                 and admission_check_mode is OptimisticAdmissionCheckMode.STATE_ONLY
             ):
                 raise RuntimeError(
-                    "state-only API batch admission is reserved for Variant H"
+                    "state-only API batch admission is reserved for Variant H or revised Variant A"
                 )
             if (
                 not marker_variant
@@ -566,6 +578,7 @@ class PlaygroundRuntime:
                     WriteFenceMode.HOT_TRANSACTIONAL.value,
                     WriteFenceMode.OPTIMISTIC_DETACH.value,
                 )
+                and not state_only_contract
                 and (
                     self.settings.source_topology != "isolated"
                     or selected_request.fence_wakeup_mode
@@ -573,7 +586,8 @@ class PlaygroundRuntime:
                 )
             ):
                 raise RuntimeError(
-                    "Variants D and E require isolated sources and the immediate fence nudge"
+                    "Variants D and E require isolated sources and the immediate fence nudge;"
+                    " Variant A requires shared sources with passive wakeup"
                 )
             validate_local_batch_budget(workload_settings, self.settings.table_count)
             scenario = {

@@ -439,6 +439,23 @@ class ResultTests(unittest.TestCase):
         with self.assertRaisesRegex(ResultValidationError, "t2f"):
             validate_result(missing_admission_fence)
 
+    def test_variant_a_accepts_state_only_batch_admission_with_slot_lsn_proof(self) -> None:
+        payload = optimistic_detach_result()
+        payload["scenario"].update(
+            {
+                "source_topology": "shared",
+                "fence_wakeup_mode": "passive",
+                "source_proof_mode": "slot_lsn_v1",
+                "optimistic_admission_check_mode": "state_only_v1",
+                "optimistic_contract_version": (
+                    "state_only_batch_first_write_admission_v4"
+                ),
+                "ownership_epoch_checks_per_api_batch": 0,
+            }
+        )
+
+        validate_result(payload)
+
     def test_schema_v4_binds_fence_wakeup_to_fence_lane_and_proof(self) -> None:
         validate_result(v4_isolated_result())
         validate_result(v4_isolated_result("passive"))

@@ -33,6 +33,29 @@ class OptimisticAdmissionCheckMode(StrEnum):
     STATE_ONLY = "state_only_v1"
 
 
+def state_only_batch_admission_supported(
+    source_topology: str,
+    fence_wakeup_mode: FenceWakeupMode | str,
+    write_fence_mode: WriteFenceMode | str,
+    source_proof_mode: SourceProofMode | str,
+) -> bool:
+    """Return whether a variant contract permits state-only foreground admission."""
+    wakeup = str(fence_wakeup_mode)
+    fence = str(write_fence_mode)
+    proof = str(source_proof_mode)
+    if (
+        fence != WriteFenceMode.OPTIMISTIC_DETACH.value
+        or wakeup != FenceWakeupMode.PASSIVE.value
+    ):
+        return False
+    if proof == SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER.value:
+        return source_topology in ("isolated", "shared")
+    return (
+        source_topology == "shared"
+        and proof == SourceProofMode.SLOT_LSN.value
+    )
+
+
 class FlipbenchError(ValueError):
     """Base class for fail-closed validation errors."""
 

@@ -27,6 +27,20 @@ def isolated_settings() -> Settings:
     )
 
 
+def shared_settings() -> Settings:
+    return Settings(
+        hot_dsn="postgresql://hot/cards",
+        warm_dsn="postgresql://warm/cards",
+        kafka_bootstrap="kafka:19092",
+        source_connect_url="http://source:8083",
+        sink_connect_url="http://sink:8083",
+        postgres_password="test-only",
+        table_count=5,
+        results_dir=Path("results"),
+        source_topology="shared",
+    )
+
+
 @unittest.skipUnless(find_spec("psycopg") is not None, "psycopg is installed in the runner image")
 class PublicationContractTests(unittest.TestCase):
     def test_variant_h_requires_state_only_application_admission(self) -> None:
@@ -66,6 +80,73 @@ class PublicationContractTests(unittest.TestCase):
                     SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER
                 ),
             )
+
+    def test_variant_h_prod_accepts_the_shared_source_topology(self) -> None:
+        from flipbench.core import SourceProofMode
+        from flipbench.flip import FlipRunner
+
+        runner = FlipRunner(
+            shared_settings(),
+            uuid.uuid4(),
+            1.0,
+            0.05,
+            scenario_metadata={
+                "write_fence_mode": "optimistic_detach_v1",
+                "retiring_write_gate_epoch": 1,
+                "optimistic_admission_check_mode": "state_only_v1",
+            },
+            source_proof_mode=SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER,
+        )
+        self.assertEqual(runner.settings.source_topology, "shared")
+        self.assertEqual(
+            runner.optimistic_admission_check_mode.value,
+            "state_only_v1",
+        )
+
+    def test_variant_a_accepts_hot_state_only_admission_with_shared_lsn_proof(self) -> None:
+        from flipbench.core import SourceProofMode
+        from flipbench.flip import FlipRunner
+
+        runner = FlipRunner(
+            shared_settings(),
+            uuid.uuid4(),
+            1.0,
+            0.05,
+            scenario_metadata={
+                "write_fence_mode": "optimistic_detach_v1",
+                "retiring_write_gate_epoch": 1,
+                "optimistic_admission_check_mode": "state_only_v1",
+            },
+            source_proof_mode=SourceProofMode.SLOT_LSN,
+        )
+
+        self.assertEqual(runner.settings.source_topology, "shared")
+        self.assertEqual(runner.source_proof_mode, SourceProofMode.SLOT_LSN)
+        self.assertEqual(
+            runner.optimistic_admission_check_mode.value,
+            "state_only_v1",
+        )
+
+    def test_serial_marker_variants_reject_the_shared_source_topology(self) -> None:
+        from flipbench.core import SourceProofMode
+        from flipbench.flip import FlipRunner
+
+        for proof_mode in (
+            SourceProofMode.PER_LEAF_MARKER,
+            SourceProofMode.ATOMIC_DETACH_MARKER,
+        ):
+            with self.assertRaisesRegex(ValueError, "isolated sources"):
+                FlipRunner(
+                    shared_settings(),
+                    uuid.uuid4(),
+                    1.0,
+                    0.05,
+                    scenario_metadata={
+                        "write_fence_mode": "optimistic_detach_v1",
+                        "retiring_write_gate_epoch": 1,
+                    },
+                    source_proof_mode=proof_mode,
+                )
 
     def test_state_only_application_admission_is_not_enabled_for_g(self) -> None:
         from flipbench.core import SourceProofMode

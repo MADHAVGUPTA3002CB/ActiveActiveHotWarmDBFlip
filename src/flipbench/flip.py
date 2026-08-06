@@ -39,6 +39,7 @@ from .core import (
     offset_gate,
     production_admission_ready,
     source_fence_satisfied,
+    state_only_batch_admission_supported,
     transition,
 )
 from .kafka_io import KafkaControl
@@ -172,29 +173,44 @@ class FlipRunner:
             SourceProofMode.PER_LEAF_MARKER,
             SourceProofMode.ATOMIC_DETACH_MARKER,
             SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER,
-        ) and (
-            settings.source_topology != "isolated"
-            or self.write_fence_mode is not WriteFenceMode.OPTIMISTIC_DETACH
-            or selected_wakeup_mode is not FenceWakeupMode.PASSIVE
         ):
-            raise ValueError(
-                "marker source proof requires isolated sources, optimistic detach, and passive heartbeat mode"
+            allowed_topologies = (
+                ("isolated", "shared")
+                if selected_proof_mode
+                is SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER
+                else ("isolated",)
             )
+            if (
+                settings.source_topology not in allowed_topologies
+                or self.write_fence_mode is not WriteFenceMode.OPTIMISTIC_DETACH
+                or selected_wakeup_mode is not FenceWakeupMode.PASSIVE
+            ):
+                raise ValueError(
+                    "marker source proof requires optimistic detach and passive heartbeat"
+                    " mode; F and G require isolated sources, and only the parallel"
+                    " marker variant (H-Prod) may use the shared source"
+                )
+        state_only_contract = state_only_batch_admission_supported(
+            settings.source_topology,
+            selected_wakeup_mode,
+            self.write_fence_mode,
+            selected_proof_mode,
+        )
         if (
-            selected_proof_mode
-            is SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER
+            state_only_contract
             and self.optimistic_admission_check_mode
             is not OptimisticAdmissionCheckMode.STATE_ONLY
         ):
-            raise ValueError("Variant H requires state-only API batch admission")
+            raise ValueError(
+                "Variant H and revised Variant A require state-only API batch admission"
+            )
         if (
-            selected_proof_mode
-            is not SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER
+            not state_only_contract
             and self.optimistic_admission_check_mode
             is OptimisticAdmissionCheckMode.STATE_ONLY
         ):
             raise ValueError(
-                "state-only API batch admission is reserved for Variant H"
+                "state-only API batch admission is reserved for Variant H or revised Variant A"
             )
 
     @staticmethod
@@ -1306,6 +1322,7 @@ class FlipRunner:
                 source_lane_evidence["t5"] = self._source_lane_snapshot(
                     source, hot, configured_sources, running_states, park_deadline
                 )
+                target_scan_starts: Mapping[TopicPartition, int] | None = None
                 if self.source_proof_mode is SourceProofMode.PER_LEAF_MARKER:
                     if hot_gate_ownership_epoch is None:
                         raise RuntimeError("leaf marker proof requires a hot ownership epoch")
@@ -1360,14 +1377,49 @@ class FlipRunner:
                             park_deadline,
                         )
                     )
-                    target_values = kafka.end_offsets(partitions)
+                    observed_starts = kafka.committed_offsets(
+                        group_by_partition,
+                        min(10.0, self._remaining(park_deadline)),
+                    )
+                    target_scan_starts = {
+                        partition: observed_starts.get(partition, 0)
+                        for partition in partitions
+                    }
+                    target_values = kafka.read_committed_target_offsets(
+                        partitions,
+                        target_scan_starts,
+                        self._remaining(park_deadline),
+                    )
                 target = OffsetVector(
                     self.settings.cell,
                     self.settings.timeslot,
                     self._attempt_epoch,
                     target_values,
                 )
-                self.mark("t8", target_offsets={item.key: target.values[item] for item in partitions})
+                target_event: dict[str, Any] = {
+                    "target_offsets": {
+                        item.key: target.values[item] for item in partitions
+                    },
+                    "target_offset_semantics": (
+                        "exact_leaf_marker_next_offset_v1"
+                        if self.source_proof_mode
+                        in (
+                            SourceProofMode.PER_LEAF_MARKER,
+                            SourceProofMode.ATOMIC_DETACH_MARKER,
+                            SourceProofMode.PARALLEL_ATOMIC_DETACH_MARKER,
+                        )
+                        else "read_committed_visible_records_v1"
+                    ),
+                }
+                if target_scan_starts is not None:
+                    target_event = {
+                        **target_event,
+                        "target_scan_start_offsets": {
+                            partition.key: target_scan_starts[partition]
+                            for partition in partitions
+                        },
+                    }
+                self.mark("t8", **target_event)
                 source_lane_evidence["t7"] = self._source_lane_snapshot(
                     source, hot, configured_sources, running_states, park_deadline
                 )

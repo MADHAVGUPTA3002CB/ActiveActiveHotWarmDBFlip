@@ -22,3 +22,4 @@ playground-ui/.vinext/
 playground-ui/.wrangler/
 playground-ui/build/
 playground-ui/dist/
+src/flipbench.egg-info/

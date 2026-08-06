@@ -131,6 +131,66 @@ class BenchmarkPlanTests(unittest.TestCase):
             "state_and_epoch_v1",
         )
 
+    def test_builds_h_prod_shared_source_variant(self) -> None:
+        payload = valid_plan()
+        payload["variants"] = ["H", "H-Prod"]
+        payload["target_tps"] = [3_000]
+        payload["repetitions"] = 1
+        plan = self.load(payload)
+
+        by_variant = {
+            case.variant: case for case in build_benchmark_cases(plan)
+        }
+        prod = by_variant["H-Prod"]
+        self.assertEqual(prod.source_topology, "shared")
+        self.assertEqual(prod.fence_wakeup_mode, "passive")
+        self.assertEqual(
+            prod.source_proof_mode,
+            "parallel_atomic_detach_marker_v1",
+        )
+        self.assertEqual(prod.write_fence_mode, "optimistic_detach_v1")
+        self.assertEqual(
+            prod.optimistic_admission_check_mode,
+            "state_only_v1",
+        )
+        self.assertEqual(prod.ownership_epoch_checks_per_api_batch, 0)
+        self.assertEqual(prod.ownership_reads_per_api_batch, 1)
+        self.assertEqual(by_variant["H"].source_topology, "isolated")
+        self.assertIn("h-prod", prod.case_id)
+
+    def test_variant_a_uses_hot_state_only_batch_admission_with_lsn_proof(self) -> None:
+        payload = valid_plan()
+        payload["variants"] = ["A", "H-Prod"]
+        payload["target_tps"] = [5_000]
+        payload["repetitions"] = 1
+        plan = self.load(payload)
+
+        by_variant = {
+            case.variant: case for case in build_benchmark_cases(plan)
+        }
+        variant_a = by_variant["A"]
+        h_prod = by_variant["H-Prod"]
+
+        self.assertEqual(variant_a.source_topology, "shared")
+        self.assertEqual(variant_a.write_fence_mode, "optimistic_detach_v1")
+        self.assertEqual(variant_a.optimistic_admission_check_mode, "state_only_v1")
+        self.assertEqual(variant_a.ownership_reads_per_api_batch, 1)
+        self.assertEqual(variant_a.ownership_epoch_checks_per_api_batch, 0)
+        self.assertEqual(variant_a.source_proof_mode, "slot_lsn_v1")
+        self.assertEqual(variant_a.fence_wakeup_mode, "passive")
+        self.assertEqual(
+            (
+                variant_a.transaction_shape,
+                variant_a.tables_per_api_transaction,
+                variant_a.operations_per_api_batch,
+            ),
+            (
+                h_prod.transaction_shape,
+                h_prod.tables_per_api_transaction,
+                h_prod.operations_per_api_batch,
+            ),
+        )
+
     def test_accepts_generic_insert_update_mix_for_benchmark_plans(self) -> None:
         payload = valid_plan()
         payload["workload"].update(  # type: ignore[union-attr]

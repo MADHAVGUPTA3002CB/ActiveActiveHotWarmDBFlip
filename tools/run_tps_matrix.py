@@ -101,7 +101,7 @@ def restart_environment(topology: str) -> str:
     raise MatrixAbort("environment restart exceeded 15 minutes")
 
 
-def configure_workload(total_tps: int) -> tuple[int, int]:
+def configure_workload(total_tps: int, variant: str) -> tuple[int, int]:
     active_tps = total_tps * 9 // 10
     retiring_tps = total_tps - active_tps
     request_json(
@@ -120,6 +120,16 @@ def configure_workload(total_tps: int) -> tuple[int, int]:
             "rate_window_seconds": 5,
             "min_achievement_percent": 80,
             "payload_bytes": 256,
+            "write_fence_mode": (
+                "optimistic_detach_v1"
+                if variant == "A"
+                else "warm_tracker_advisory_v1"
+            ),
+            "optimistic_admission_check_mode": (
+                "state_only_v1"
+                if variant == "A"
+                else "state_and_epoch_v1"
+            ),
         },
     )
     request_json(
@@ -185,7 +195,7 @@ def run_case(variant: str, topology: str, wakeup: str, total_tps: int) -> dict[s
     started_at = datetime.now(timezone.utc).isoformat()
     print(f"\n[{variant} @ {total_tps:,} TPS] resetting {topology} topology", flush=True)
     generation_id = restart_environment(topology)
-    active_tps, retiring_tps = configure_workload(total_tps)
+    active_tps, retiring_tps = configure_workload(total_tps, variant)
     request_json(API, "/workload/start", method="POST", payload={})
     print(
         f"    writes started: active={active_tps:,}, retiring={retiring_tps:,}, rows/tx=1",
@@ -293,7 +303,10 @@ def run_case(variant: str, topology: str, wakeup: str, total_tps: int) -> dict[s
         API,
         "/flip/start",
         method="POST",
-        payload={"fence_wakeup_mode": wakeup},
+        payload={
+            "fence_wakeup_mode": wakeup,
+            "source_proof_mode": "slot_lsn_v1",
+        },
     )
     flip_deadline = time.monotonic() + 180
     final_state: Mapping[str, Any] | None = None
